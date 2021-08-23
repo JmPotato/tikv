@@ -2111,6 +2111,7 @@ dependencies = [
 [[package]]
 name = "kvproto"
 version = "0.0.2"
+source = "git+https://github.com/JmPotato/kvproto?branch=region_cpu_report#f4e72506698ddadace6d357549228eb8c9df0983"
 dependencies = [
  "futures 0.3.15",
  "grpcio",
