@@ -15,7 +15,7 @@ use kvproto::metapb::{self, Peer};
 use kvproto::pdpb::QueryKind;
 use pd_client::{merge_bucket_stats, new_bucket_stats, BucketMeta, BucketStat};
 use tikv_util::config::Tracker;
-use tikv_util::{debug, info};
+use tikv_util::info;
 
 use crate::store::metrics::*;
 use crate::store::worker::query_stats::{is_read_query, QueryStats};
@@ -545,7 +545,7 @@ impl AutoSplitController {
             let byte = region_infos
                 .iter()
                 .fold(0, |flow, region_info| flow + region_info.flow.read_bytes);
-            debug!("load base split params";
+            info!("load base split params";
                 "region_id" => region_id,
                 "qps" => qps,
                 "qps_threshold" => self.cfg.qps_threshold,
@@ -582,7 +582,19 @@ impl AutoSplitController {
                     .inc();
                 continue;
             }
-            recorder.record(key_ranges);
+            recorder.record(key_ranges.clone());
+            info!("recorder record";
+                "region_id" => region_id,
+                "key_ranges" => key_ranges.len(),
+                "recorder.detect_times" => recorder.detect_times,
+                "recorder.detected_times" => recorder.detected_times,
+                "recorder.key_ranges" => recorder.key_ranges.len(),
+                "recorder.create_time.elapsed" => if let Ok(elapsed) = recorder.create_time.elapsed() {
+                    format!("{}ms", elapsed.as_millis())
+                } else {
+                    "unknown".to_owned()
+                },
+            );
             if recorder.is_ready() {
                 let key = recorder.collect(&self.cfg);
                 if !key.is_empty() {
