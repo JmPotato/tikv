@@ -194,6 +194,11 @@ impl Samples {
     fn split_key(&self, split_balance_score: f64, split_contained_score: f64) -> Vec<u8> {
         let mut best_index: i32 = -1;
         let mut best_score = 2.0;
+        // Debug variables.
+        let mut unbalanced_count = 0;
+        let mut crossed_count = 0;
+        let mut best_balance_score: f64 = 0.0;
+        let mut best_contained_score: f64 = 0.0;
         for (index, sample) in self.0.iter().enumerate() {
             if sample.key.is_empty() {
                 continue;
@@ -215,6 +220,7 @@ impl Samples {
                 .with_label_values(&["balance_score"])
                 .observe(balance_score);
             if balance_score >= split_balance_score {
+                unbalanced_count += 1;
                 LOAD_BASE_SPLIT_EVENT
                     .with_label_values(&[NO_BALANCE_KEY])
                     .inc();
@@ -228,6 +234,7 @@ impl Samples {
                 .with_label_values(&["contained_score"])
                 .observe(contained_score);
             if contained_score >= split_contained_score {
+                crossed_count += 1;
                 LOAD_BASE_SPLIT_EVENT
                     .with_label_values(&[NO_UNCROSS_KEY])
                     .inc();
@@ -236,14 +243,31 @@ impl Samples {
 
             // We try to find a split key that has the smallest balance score and the smallest contained score
             // to make the splitting keep the load balanced while not increasing too many RPCs.
-            let final_score = balance_score + contained_score;
-            if final_score < best_score {
+            if balance_score + contained_score < best_score {
                 best_index = index as i32;
-                best_score = final_score;
+                best_balance_score = balance_score;
+                best_contained_score = contained_score;
+                best_score = balance_score + contained_score;
             }
         }
+        info!("split_key result";
+            "best_index" => best_index,
+            "best_score" => best_score,
+            "unbalanced_count" => unbalanced_count,
+            "crossed_count" => crossed_count,
+        );
         if best_index >= 0 {
-            return self.0[best_index as usize].key.clone();
+            let best_sample = &self.0[best_index as usize];
+            info!("split_key best result details";
+                "best_index" => best_index,
+                "best_score" => best_score,
+                "best_balance_score" => best_balance_score,
+                "best_contained_score" => best_contained_score,
+                "best_sample.left" => best_sample.left,
+                "best_sample.contained" => best_sample.contained,
+                "best_sample.right" => best_sample.right,
+            );
+            return best_sample.key.clone();
         }
         return vec![];
     }
@@ -290,8 +314,14 @@ impl Recorder {
     // evaluate the samples according to the given key range, and compute the split keys finally.
     fn collect(&self, config: &SplitConfig) -> Vec<u8> {
         let sampled_key_ranges = sample(config.sample_num, self.key_ranges.clone(), |x| x);
+        info!("sampled_key_ranges result";
+            "key_ranges" => ?sampled_key_ranges.clone(),
+        );
         let mut samples = Samples::from(sampled_key_ranges);
         let recorded_key_ranges: Vec<&KeyRange> = self.key_ranges.iter().flatten().collect();
+        info!("recorded_key_ranges result";
+            "key_ranges" => ?recorded_key_ranges.clone(),
+        );
         // Because we need to observe the number of `no_enough_key` of all the actual keys,
         // so we do this check after the samples are calculated.
         if (recorded_key_ranges.len() as u64) < config.sample_threshold {
