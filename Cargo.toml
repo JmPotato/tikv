@@ -175,6 +175,7 @@ zipf = "6.1.0"
 hyper-openssl = "0.9"
 
 [patch.crates-io]
+grpcio = { git = "https://github.com/JmPotato/grpc-rs", branch = "poll_cpu_usage_collector" }
 # TODO: remove this when new raft-rs is published.
 raft = { git = "https://github.com/tikv/raft-rs", branch = "master" }
 raft-proto = { git = "https://github.com/tikv/raft-rs", branch = "master" }

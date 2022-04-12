@@ -5,11 +5,13 @@ use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::slice::{Iter, IterMut};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use rand::Rng;
 
+use cpu_observer::{Collector, CollectorGuard, CollectorRegHandle, Records};
 use kvproto::kvrpcpb::KeyRange;
 use kvproto::metapb::{self, Peer};
 use kvproto::pdpb::QueryKind;
@@ -500,6 +502,8 @@ pub struct AutoSplitController {
     pub recorders: HashMap<u64, Recorder>,
     cfg: SplitConfig,
     cfg_tracker: Tracker<SplitConfig>,
+    grpc_cpu_records_receiver: Option<Receiver<Arc<Records>>>,
+    grpc_cpu_collector_guard: Option<CollectorGuard>,
 }
 
 impl AutoSplitController {
@@ -508,11 +512,20 @@ impl AutoSplitController {
             recorders: HashMap::default(),
             cfg: config_manager.value().clone(),
             cfg_tracker: config_manager.0.clone().tracker("split_hub".to_owned()),
+            grpc_cpu_records_receiver: None,
+            grpc_cpu_collector_guard: None,
         }
     }
 
     pub fn default() -> AutoSplitController {
         AutoSplitController::new(SplitConfigManager::default())
+    }
+
+    pub fn init_grpc_cpu_collector(&mut self, collector_reg_handle: CollectorRegHandle) {
+        let (sender, receiver) = mpsc::channel();
+        self.grpc_cpu_records_receiver = Some(receiver);
+        self.grpc_cpu_collector_guard =
+            Some(collector_reg_handle.register(Box::new(RPCPollCPUCollector::new(sender))))
     }
 
     // collect the read stats from read_stats_vec and dispatch them to a region hashmap.
@@ -531,12 +544,38 @@ impl AutoSplitController {
         region_infos_map
     }
 
+    fn collect_grpc_poll_cpu(&self) {
+        if self.grpc_cpu_records_receiver.is_none() {
+            return;
+        }
+        let mut records = vec![];
+        while let Ok(other) = self.grpc_cpu_records_receiver.as_ref().unwrap().try_recv() {
+            records.push(other);
+        }
+        let mut grpc_method_poll_cpu_usage = HashMap::new();
+        records.iter().for_each(|records: &Arc<Records>| {
+            records.records.iter().for_each(|(tag, record)| {
+                if let Some(name) = tag.name() {
+                    *grpc_method_poll_cpu_usage.entry(name).or_insert(0) += record.cpu_time;
+                }
+            });
+        });
+        grpc_method_poll_cpu_usage
+            .iter()
+            .for_each(|(method, cpu_time)| {
+                GRPC_METHOD_POLL_CPU_SECONDS
+                    .with_label_values(&[method])
+                    .set(*cpu_time as f64 / 1000_f64);
+            });
+    }
+
     // flush the read stats info into the recorder and check if the region needs to be split
     // according to all the stats info the recorder has collected before.
     pub fn flush(&mut self, read_stats_vec: Vec<ReadStats>) -> (Vec<usize>, Vec<SplitInfo>) {
         let mut split_infos = vec![];
         let mut top = BinaryHeap::with_capacity(TOP_N as usize);
         let region_infos_map = Self::collect_read_stats(read_stats_vec);
+        self.collect_grpc_poll_cpu();
 
         for (region_id, region_infos) in region_infos_map {
             let qps_prefix_sum = prefix_sum(region_infos.iter(), RegionInfo::get_read_qps);
@@ -625,6 +664,23 @@ impl AutoSplitController {
         if let Some(incoming) = self.cfg_tracker.any_new() {
             self.cfg = incoming.clone();
         }
+    }
+}
+
+struct RPCPollCPUCollector {
+    sender: Sender<Arc<Records>>,
+}
+
+impl RPCPollCPUCollector {
+    fn new(sender: Sender<Arc<Records>>) -> RPCPollCPUCollector {
+        RPCPollCPUCollector { sender }
+    }
+}
+
+impl Collector for RPCPollCPUCollector {
+    fn collect(&self, records: Arc<Records>) {
+        // info!("RPCPollCPUCollector collect"; "records" => ?records);
+        self.sender.send(records).unwrap();
     }
 }
 
@@ -828,7 +884,7 @@ mod tests {
     }
 
     fn check_split(mode: &[u8], qps_stats: Vec<ReadStats>, split_keys: Vec<&[u8]>) {
-        let mut hub = AutoSplitController::new(SplitConfigManager::default());
+        let mut hub = AutoSplitController::default();
         hub.cfg.qps_threshold = 1;
         hub.cfg.sample_threshold = 0;
 
@@ -861,7 +917,7 @@ mod tests {
 
     #[test]
     fn test_sample_key_num() {
-        let mut hub = AutoSplitController::new(SplitConfigManager::default());
+        let mut hub = AutoSplitController::default();
         hub.cfg.qps_threshold = 2000;
         hub.cfg.sample_num = 2000;
         hub.cfg.sample_threshold = 0;
@@ -1161,7 +1217,7 @@ mod tests {
             other_qps_stats.push(default_qps_stats());
         }
         b.iter(|| {
-            let mut hub = AutoSplitController::new(SplitConfigManager::default());
+            let mut hub = AutoSplitController::default();
             hub.flush(other_qps_stats.clone());
         });
     }

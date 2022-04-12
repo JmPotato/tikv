@@ -28,6 +28,7 @@ use std::{
 use api_version::{dispatch_api_version, APIVersion};
 use cdc::{CdcConfigManager, MemoryQuota};
 use concurrency_manager::ConcurrencyManager;
+use cpu_observer::RecorderWorker;
 use encryption_export::{data_key_manager_from_config, DataKeyManager};
 use engine_rocks::raw::{Cache, Env};
 use engine_rocks::{from_rocks_compression_type, FlowInfo, RocksEngine};
@@ -195,6 +196,7 @@ struct TiKVServer<ER: RaftEngine> {
     env: Arc<Environment>,
     background_worker: Worker,
     quota_limiter: Arc<QuotaLimiter>,
+    recorder_worker: Option<Box<RecorderWorker>>,
 }
 
 struct TiKVEngines<EK: KvEngine, ER: RaftEngine> {
@@ -227,10 +229,16 @@ impl<ER: RaftEngine> TiKVServer<ER> {
             SecurityManager::new(&config.security)
                 .unwrap_or_else(|e| fatal!("failed to create security manager: {}", e)),
         );
+        let (observer_tag_factory, cpu_collector_reg_handle, recorder_worker) =
+            cpu_observer::init_recorder(
+                "grpc_poll_cpu_recorder",
+                Duration::from_secs(1).as_millis() as _,
+            );
         let env = Arc::new(
             EnvBuilder::new()
                 .cq_count(config.server.grpc_concurrency)
                 .name_prefix(thd_name!(GRPC_THREAD_PREFIX))
+                .init_cpu_observer(observer_tag_factory, cpu_collector_reg_handle)
                 .build(),
         );
         let pd_client =
@@ -293,6 +301,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
             flow_info_sender: None,
             flow_info_receiver: None,
             quota_limiter,
+            recorder_worker: Some(recorder_worker),
         }
     }
 
@@ -860,7 +869,13 @@ impl<ER: RaftEngine> TiKVServer<ER> {
             Box::new(split_config_manager.clone()),
         );
 
-        let auto_split_controller = AutoSplitController::new(split_config_manager);
+        let mut auto_split_controller = AutoSplitController::new(split_config_manager);
+        if let Some(cpu_collector_reg_handle) = self.env.cpu_collector_reg_handle() {
+            auto_split_controller.init_grpc_cpu_collector(cpu_collector_reg_handle);
+        }
+        if let Some(recorder_worker) = self.recorder_worker.take() {
+            self.to_stop.push(recorder_worker);
+        }
 
         // `ConsistencyCheckObserver` must be registered before `Node::start`.
         let safe_point = Arc::new(AtomicU64::new(0));
@@ -1528,6 +1543,12 @@ impl Stop for Worker {
 }
 
 impl<T: fmt::Display + Send + 'static> Stop for LazyWorker<T> {
+    fn stop(self: Box<Self>) {
+        self.stop_worker();
+    }
+}
+
+impl Stop for RecorderWorker {
     fn stop(self: Box<Self>) {
         self.stop_worker();
     }

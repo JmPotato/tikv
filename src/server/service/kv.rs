@@ -201,7 +201,7 @@ macro_rules! handle_request {
             })
             .map(|_|());
 
-            ctx.spawn(task);
+            ctx.spawn_with_method_path(task, stringify!($fn_name));
         }
     }
 }
@@ -383,7 +383,7 @@ impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockManager, Api: API
         })
         .map(|_| ());
 
-        ctx.spawn(task);
+        ctx.spawn_with_method_path(task, "coprocessor");
     }
 
     fn raw_coprocessor(
@@ -410,7 +410,7 @@ impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockManager, Api: API
         })
         .map(|_| ());
 
-        ctx.spawn(task);
+        ctx.spawn_with_method_path(task, "raw_coprocessor");
     }
 
     fn register_lock_observer(
@@ -659,7 +659,7 @@ impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockManager, Api: API
             }
         };
 
-        ctx.spawn(future);
+        ctx.spawn_with_method_path(future, "coprocessor_stream");
     }
 
     fn raft(
@@ -1003,7 +1003,7 @@ impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockManager, Api: API
             }
             future::ok(())
         });
-        ctx.spawn(request_handler.unwrap_or_else(|e| error!("batch_commands error"; "err" => %e)));
+        ctx.spawn_with_method_path(request_handler.unwrap_or_else(|e| error!("batch_commands error"; "err" => %e)), "batch_commands_request");
 
         let grpc_thread_load = Arc::clone(&self.grpc_thread_load);
         let response_retriever = BatchReceiver::new(
@@ -1044,7 +1044,7 @@ impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockManager, Api: API
         })
         .map(|_| ());
 
-        ctx.spawn(send_task);
+        ctx.spawn_with_method_path(send_task, "batch_commands_response");
     }
 
     fn batch_coprocessor(

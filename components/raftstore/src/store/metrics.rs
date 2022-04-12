@@ -635,6 +635,13 @@ lazy_static! {
     pub static ref STORE_PERF_CONTEXT_TIME_HISTOGRAM_STATIC: PerfContextTimeDuration=
         auto_flush_from!(STORE_PERF_CONTEXT_TIME_HISTOGRAM, PerfContextTimeDuration);
 
+    pub static ref GRPC_METHOD_POLL_CPU_SECONDS: GaugeVec =
+        register_gauge_vec!(
+            "tikv_grpc_method_poll_cpu_usage",
+            "Collect the gRPC method CPU poll usage.",
+        &["method"]
+        ).unwrap();
+
     pub static ref READ_QPS_TOPN: GaugeVec =
         register_gauge_vec!(
             "tikv_read_qps_topn",
