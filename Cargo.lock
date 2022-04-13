@@ -941,12 +941,14 @@ dependencies = [
 [[package]]
 name = "cpu_observer"
 version = "0.1.0"
-source = "git+https://github.com/JmPotato/cpu_observer?branch=main#9e50b1608dd9bcebaba2eb321d74fe44115e8343"
+source = "git+https://github.com/JmPotato/cpu_observer?branch=main#e30e3c0a900876e0d2b66fa412e74031aaa8bd0b"
 dependencies = [
  "crossbeam",
  "futures 0.3.15",
  "futures-timer",
+ "lazy_static",
  "libc 0.2.119",
+ "procinfo",
  "yatp",
 ]
 

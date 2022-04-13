@@ -552,6 +552,7 @@ impl AutoSplitController {
         while let Ok(other) = self.grpc_cpu_records_receiver.as_ref().unwrap().try_recv() {
             records.push(other);
         }
+        let mut collect_interval = Duration::default();
         let mut grpc_method_poll_cpu_usage = HashMap::new();
         records.iter().for_each(|records: &Arc<Records>| {
             records.records.iter().for_each(|(tag, record)| {
@@ -559,13 +560,14 @@ impl AutoSplitController {
                     *grpc_method_poll_cpu_usage.entry(name).or_insert(0) += record.cpu_time;
                 }
             });
+            collect_interval += records.duration;
         });
         grpc_method_poll_cpu_usage
             .iter()
             .for_each(|(method, cpu_time)| {
-                GRPC_METHOD_POLL_CPU_SECONDS
+                GRPC_METHOD_POLL_CPU_USAGE
                     .with_label_values(&[method])
-                    .set(*cpu_time as f64 / 1000_f64);
+                    .set(*cpu_time as f64 / collect_interval.as_millis() as f64);
             });
     }
 
