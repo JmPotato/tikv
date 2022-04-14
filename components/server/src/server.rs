@@ -231,7 +231,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
         );
         let (observer_tag_factory, cpu_collector_reg_handle, recorder_worker) =
             cpu_observer::init_recorder(
-                "grpc_poll_cpu_recorder",
+                thd_name!("grpc_poll_cpu_recorder"),
                 Duration::from_secs(1).as_millis() as _,
             );
         let env = Arc::new(
