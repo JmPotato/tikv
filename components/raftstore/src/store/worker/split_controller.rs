@@ -14,6 +14,7 @@ use kvproto::kvrpcpb::KeyRange;
 use kvproto::metapb::{self, Peer};
 use kvproto::pdpb::QueryKind;
 use pd_client::{merge_bucket_stats, new_bucket_stats, BucketMeta, BucketStat};
+use resource_metering::RawRecords;
 use tikv_util::config::Tracker;
 use tikv_util::{debug, info, warn};
 
@@ -324,10 +325,10 @@ impl Recorder {
     }
 }
 
-// RegionInfo will maintain key_ranges with sample_num length by reservoir sampling.
-// And it will save qps num and peer.
+// RegionReadInfo will maintain `key_ranges` with `sample_num` length by reservoir sampling,
+// QPS and peer info.
 #[derive(Debug, Clone)]
-pub struct RegionInfo {
+pub struct RegionReadInfo {
     pub sample_num: usize,
     pub query_stats: QueryStats,
     pub peer: Peer,
@@ -335,9 +336,9 @@ pub struct RegionInfo {
     pub flow: FlowStatistics,
 }
 
-impl RegionInfo {
-    fn new(sample_num: usize) -> RegionInfo {
-        RegionInfo {
+impl RegionReadInfo {
+    fn new(sample_num: usize) -> RegionReadInfo {
+        RegionReadInfo {
             sample_num,
             query_stats: QueryStats::default(),
             key_ranges: Vec::with_capacity(sample_num),
@@ -388,7 +389,7 @@ pub struct ReadStats {
     //   3. add_flow
     // Among these three methods, `add_flow` will not update `key_ranges` of `RegionInfo`,
     // and due to this, an `RegionInfo` without `key_ranges` may occur. The caller should be aware of this.
-    pub region_infos: HashMap<u64, RegionInfo>,
+    pub region_read_infos: HashMap<u64, RegionReadInfo>,
     pub sample_num: usize,
     pub region_buckets: HashMap<u64, BucketStat>,
 }
@@ -396,7 +397,7 @@ pub struct ReadStats {
 impl ReadStats {
     pub fn with_sample_num(sample_num: usize) -> Self {
         ReadStats {
-            region_infos: HashMap::default(),
+            region_read_infos: HashMap::default(),
             region_buckets: HashMap::default(),
             sample_num,
         }
@@ -422,9 +423,9 @@ impl ReadStats {
         let sample_num = self.sample_num;
         let query_num = key_ranges.len() as u64;
         let region_info = self
-            .region_infos
+            .region_read_infos
             .entry(region_id)
-            .or_insert_with(|| RegionInfo::new(sample_num));
+            .or_insert_with(|| RegionReadInfo::new(sample_num));
         region_info.update_peer(peer);
         if is_read_query(kind) {
             region_info.add_key_ranges(key_ranges);
@@ -443,9 +444,9 @@ impl ReadStats {
     ) {
         let num = self.sample_num;
         let region_info = self
-            .region_infos
+            .region_read_infos
             .entry(region_id)
-            .or_insert_with(|| RegionInfo::new(num));
+            .or_insert_with(|| RegionReadInfo::new(num));
         region_info.flow.add(write);
         region_info.flow.add(data);
         if let Some(buckets) = buckets {
@@ -479,7 +480,7 @@ impl ReadStats {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.region_infos.is_empty()
+        self.region_read_infos.is_empty()
     }
 }
 
@@ -487,7 +488,7 @@ impl Default for ReadStats {
     fn default() -> ReadStats {
         ReadStats {
             sample_num: get_sample_num(),
-            region_infos: HashMap::default(),
+            region_read_infos: HashMap::default(),
             region_buckets: HashMap::default(),
         }
     }
@@ -509,6 +510,27 @@ impl WriteStats {
 
     pub fn is_empty(&self) -> bool {
         self.region_infos.is_empty()
+    }
+}
+
+#[derive(Debug, Default)]
+struct RegionsInfo {
+    read_info_map: HashMap<u64, Vec<RegionReadInfo>>,
+    cpu_info_map: HashMap<u64, f64>,
+}
+
+impl RegionsInfo {
+    fn update_region_read_info(&mut self, region_id: u64, region_read_info: RegionReadInfo) {
+        let read_infos = self
+            .read_info_map
+            .entry(region_id)
+            .or_insert_with(Vec::default);
+        read_infos.push(region_read_info);
+    }
+
+    fn update_region_cpu_info(&mut self, region_id: u64, cpu_usage: f64) {
+        let cpu_info = self.cpu_info_map.entry(region_id).or_insert_with(|| 0.0);
+        *cpu_info = cpu_usage;
     }
 }
 
@@ -538,34 +560,54 @@ impl AutoSplitController {
         AutoSplitController::new(SplitConfigManager::default())
     }
 
-    // collect the read stats from read_stats_vec and dispatch them to a region hashmap.
-    fn collect_read_stats(read_stats_vec: Vec<ReadStats>) -> HashMap<u64, Vec<RegionInfo>> {
-        // collect from different thread
-        let mut region_infos_map = HashMap::default(); // regionID-regionInfos
-        let capacity = read_stats_vec.len();
-        for read_stats in read_stats_vec {
-            for (region_id, region_info) in read_stats.region_infos {
-                let region_infos = region_infos_map
-                    .entry(region_id)
-                    .or_insert_with(|| Vec::with_capacity(capacity));
-                region_infos.push(region_info);
-            }
-        }
-        region_infos_map
+    // collect the read stats from read_stats_vec and cpu_info_vec into a region hashmap.
+    fn collect_regions_info(
+        read_stats_vec: Vec<ReadStats>,
+        cpu_info_vec: Vec<Arc<RawRecords>>,
+    ) -> RegionsInfo {
+        let mut regions_info = RegionsInfo::default();
+        // Collect the read stats from different threads.
+        read_stats_vec.iter().for_each(|read_stats| {
+            read_stats
+                .region_read_infos
+                .iter()
+                .for_each(|(region_id, region_read_info)| {
+                    regions_info.update_region_read_info(*region_id, region_read_info.clone());
+                });
+        });
+        // Calculate the Region CPU usage.
+        let mut collect_interval_ms = 0;
+        let mut region_cpu_times = HashMap::new();
+        cpu_info_vec.iter().for_each(|cpu_info| {
+            cpu_info.records.iter().for_each(|(tag, record)| {
+                let region_cpu_time = region_cpu_times.entry(tag.region_id).or_insert_with(|| 0);
+                *region_cpu_time += record.cpu_time;
+            });
+            collect_interval_ms += cpu_info.duration.as_millis();
+        });
+        region_cpu_times.iter().for_each(|(region_id, cpu_time)| {
+            regions_info
+                .update_region_cpu_info(*region_id, *cpu_time as f64 / collect_interval_ms as f64);
+        });
+        regions_info
     }
 
     // flush the read stats info into the recorder and check if the region needs to be split
     // according to all the stats info the recorder has collected before.
-    pub fn flush(&mut self, read_stats_vec: Vec<ReadStats>) -> (Vec<usize>, Vec<SplitInfo>) {
+    pub fn flush(
+        &mut self,
+        read_stats_vec: Vec<ReadStats>,
+        cpu_info_vec: Vec<Arc<RawRecords>>,
+    ) -> (Vec<usize>, Vec<SplitInfo>) {
         let mut split_infos = vec![];
         let mut top = BinaryHeap::with_capacity(TOP_N as usize);
-        let region_infos_map = Self::collect_read_stats(read_stats_vec);
+        let regions_info = Self::collect_regions_info(read_stats_vec, cpu_info_vec);
 
-        for (region_id, region_infos) in region_infos_map {
-            let qps_prefix_sum = prefix_sum(region_infos.iter(), RegionInfo::get_read_qps);
+        for (region_id, read_info_vec) in regions_info.read_info_map {
+            let qps_prefix_sum = prefix_sum(read_info_vec.iter(), RegionReadInfo::get_read_qps);
             // region_infos is not empty, so it's safe to unwrap here.
             let qps = *qps_prefix_sum.last().unwrap();
-            let byte = region_infos
+            let byte = read_info_vec
                 .iter()
                 .fold(0, |flow, region_info| flow + region_info.flow.read_bytes);
             debug!("load base split params";
@@ -592,12 +634,12 @@ impl AutoSplitController {
                 .recorders
                 .entry(region_id)
                 .or_insert_with(|| Recorder::new(detect_times));
-            recorder.update_peer(&region_infos[0].peer);
+            recorder.update_peer(&read_info_vec[0].peer);
 
             let key_ranges = sample(
                 self.cfg.sample_num,
-                region_infos,
-                RegionInfo::get_key_ranges_mut,
+                read_info_vec,
+                RegionReadInfo::get_key_ranges_mut,
             );
             if key_ranges.is_empty() {
                 LOAD_BASE_SPLIT_EVENT
@@ -857,7 +899,7 @@ mod tests {
         hub.cfg.sample_threshold = 0;
 
         for i in 0..10 {
-            let (_, split_infos) = hub.flush(qps_stats.clone());
+            let (_, split_infos) = hub.flush(qps_stats.clone(), vec![]);
             if (i + 1) % hub.cfg.detect_times == 0 {
                 assert_eq!(
                     split_infos.len(),
@@ -913,7 +955,7 @@ mod tests {
                 );
             }
             qps_stats_vec.push(qps_stats);
-            hub.flush(qps_stats_vec);
+            hub.flush(qps_stats_vec, vec![]);
         }
 
         // Test the empty key ranges.
@@ -926,7 +968,7 @@ mod tests {
             qps_stats.add_query_num(1, &Peer::default(), KeyRange::default(), QueryKind::Get);
         }
         qps_stats_vec.push(qps_stats);
-        hub.flush(qps_stats_vec);
+        hub.flush(qps_stats_vec, vec![]);
     }
 
     fn check_sample_length(key_ranges: Vec<Vec<KeyRange>>) {
@@ -1175,7 +1217,7 @@ mod tests {
         r.add_query_num_batch(region_id, &Peer::default(), key_ranges, QueryKind::Get);
         let key_ranges = build_key_ranges(b"b", b"b", r.sample_num * 1000);
         r.add_query_num_batch(region_id, &Peer::default(), key_ranges, QueryKind::Get);
-        let samples = &r.region_infos.get(&region_id).unwrap().key_ranges;
+        let samples = &r.region_read_infos.get(&region_id).unwrap().key_ranges;
         let num = samples
             .iter()
             .filter(|key_range| key_range.start_key == b"b")
@@ -1218,7 +1260,7 @@ mod tests {
         }
         b.iter(|| {
             let mut hub = AutoSplitController::new(SplitConfigManager::default());
-            hub.flush(other_qps_stats.clone());
+            hub.flush(other_qps_stats.clone(), vec![]);
         });
     }
 

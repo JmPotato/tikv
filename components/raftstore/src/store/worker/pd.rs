@@ -401,6 +401,7 @@ where
     handle: Option<JoinHandle<()>>,
     timer: Option<Sender<bool>>,
     read_stats_sender: Option<Sender<ReadStats>>,
+    region_cpu_info_sender: Option<Sender<Arc<RawRecords>>>,
     collect_store_infos_interval: Duration,
     load_base_split_check_interval: Duration,
     collect_tick_interval: Duration,
@@ -422,6 +423,7 @@ where
             handle: None,
             timer: None,
             read_stats_sender: None,
+            region_cpu_info_sender: None,
             collect_store_infos_interval: interval,
             load_base_split_check_interval: cmp::min(
                 DEFAULT_LOAD_BASE_SPLIT_CHECK_INTERVAL,
@@ -460,32 +462,40 @@ where
             .report_min_resolved_ts_interval
             .div_duration_f64(tick_interval) as u64;
 
-        let (tx, rx) = mpsc::channel();
-        self.timer = Some(tx);
+        let (timer_tx, timer_rx) = mpsc::channel();
+        self.timer = Some(timer_tx);
 
-        let (sender, receiver) = mpsc::channel();
-        self.read_stats_sender = Some(sender);
+        let (read_stats_sender, read_stats_receiver) = mpsc::channel();
+        self.read_stats_sender = Some(read_stats_sender);
+
+        let (region_cpu_info_sender, region_cpu_info_receiver) = mpsc::channel();
+        self.region_cpu_info_sender = Some(region_cpu_info_sender);
 
         let scheduler = self.scheduler.clone();
         let props = tikv_util::thread_group::current_properties();
 
+        #[inline(always)]
         fn is_enable_tick(timer_cnt: u64, interval: u64) -> bool {
             interval != 0 && timer_cnt % interval == 0
         }
+
         let h = Builder::new()
             .name(thd_name!("stats-monitor"))
             .spawn(move || {
                 tikv_util::thread_group::set_properties(props);
                 tikv_alloc::add_thread_memory_accessor();
                 let mut thread_stats = ThreadInfoStatistics::new();
-                while let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(tick_interval) {
+                while let Err(mpsc::RecvTimeoutError::Timeout) =
+                    timer_rx.recv_timeout(tick_interval)
+                {
                     if is_enable_tick(timer_cnt, collect_store_infos_interval) {
                         StatsMonitor::collect_store_infos(&mut thread_stats, &scheduler);
                     }
                     if is_enable_tick(timer_cnt, load_base_split_check_interval) {
                         StatsMonitor::load_base_split(
                             &mut auto_split_controller,
-                            &receiver,
+                            &read_stats_receiver,
+                            &region_cpu_info_receiver,
                             &scheduler,
                         );
                     }
@@ -529,15 +539,20 @@ where
 
     pub fn load_base_split(
         auto_split_controller: &mut AutoSplitController,
-        receiver: &Receiver<ReadStats>,
+        region_read_stats_receiver: &Receiver<ReadStats>,
+        region_cpu_info_receiver: &Receiver<Arc<RawRecords>>,
         scheduler: &Scheduler<Task<EK, ER>>,
     ) {
         auto_split_controller.refresh_cfg();
-        let mut others = vec![];
-        while let Ok(other) = receiver.try_recv() {
-            others.push(other);
+        let mut region_read_stats = vec![];
+        while let Ok(read_stats) = region_read_stats_receiver.try_recv() {
+            region_read_stats.push(read_stats);
         }
-        let (top, split_infos) = auto_split_controller.flush(others);
+        let mut region_cpu_infos = vec![];
+        while let Ok(cpu_info) = region_cpu_info_receiver.try_recv() {
+            region_cpu_infos.push(cpu_info);
+        }
+        let (top, split_infos) = auto_split_controller.flush(region_read_stats, region_cpu_infos);
         auto_split_controller.clear();
         let task = Task::AutoSplit { split_infos };
         if let Err(e) = scheduler.schedule(task) {
@@ -592,8 +607,14 @@ where
         }
     }
 
-    pub fn get_sender(&self) -> &Option<Sender<ReadStats>> {
+    #[inline(always)]
+    fn get_read_stats_sender(&self) -> &Option<Sender<ReadStats>> {
         &self.read_stats_sender
+    }
+
+    #[inline(always)]
+    fn get_region_cpu_info_sender(&self) -> &Option<Sender<Arc<RawRecords>>> {
+        &self.region_cpu_info_sender
     }
 }
 
@@ -815,7 +836,7 @@ where
 
         let _region_cpu_records_collector = collector_reg_handle.register(
             Box::new(RegionCPUMeteringCollector::new(scheduler.clone())),
-            true,
+            false,
         );
 
         Runner {
@@ -1459,7 +1480,7 @@ where
     }
 
     fn handle_read_stats(&mut self, mut read_stats: ReadStats) {
-        for (region_id, region_info) in read_stats.region_infos.iter_mut() {
+        for (region_id, region_info) in read_stats.region_read_infos.iter_mut() {
             let peer_stat = self
                 .region_peers
                 .entry(*region_id)
@@ -1478,8 +1499,8 @@ where
         for (_, region_buckets) in mem::take(&mut read_stats.region_buckets) {
             self.merge_buckets(region_buckets);
         }
-        if !read_stats.region_infos.is_empty() {
-            if let Some(sender) = self.stats_monitor.get_sender() {
+        if !read_stats.region_read_infos.is_empty() {
+            if let Some(sender) = self.stats_monitor.get_read_stats_sender() {
                 if sender.send(read_stats).is_err() {
                     warn!("send read_stats failed, are we shutting down?")
                 }
@@ -1608,6 +1629,12 @@ where
     // which is the read load portion of the write path.
     // TODO: more accurate CPU consumption of a specified region.
     fn handle_region_cpu_records(&mut self, records: Arc<RawRecords>) {
+        // Send Region CPU info to AutoSplitController inside the stats_monitor.
+        if let Some(sender) = self.stats_monitor.get_region_cpu_info_sender() {
+            if sender.send(records.clone()).is_err() {
+                warn!("send region cpu info failed, are we shutting down?")
+            }
+        }
         calculate_region_cpu_records(self.store_id, records, &mut self.region_cpu_records);
     }
 
