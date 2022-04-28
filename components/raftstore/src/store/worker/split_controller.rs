@@ -16,6 +16,7 @@ use kvproto::pdpb::QueryKind;
 use pd_client::{merge_bucket_stats, new_bucket_stats, BucketMeta, BucketStat};
 use resource_metering::RawRecords;
 use tikv_util::config::Tracker;
+use tikv_util::metrics::ThreadInfoStatistics;
 use tikv_util::{debug, info, warn};
 
 use crate::store::metrics::*;
@@ -532,6 +533,10 @@ impl RegionsInfo {
         let cpu_info = self.cpu_info_map.entry(region_id).or_insert_with(|| 0.0);
         *cpu_info = cpu_usage;
     }
+
+    fn get_region_cpu_usage(&self, region_id: &u64) -> f64 {
+        *self.cpu_info_map.get(region_id).unwrap_or(&0.0)
+    }
 }
 
 pub struct SplitInfo {
@@ -592,18 +597,44 @@ impl AutoSplitController {
         regions_info
     }
 
+    fn collect_thread_usage_and_count(
+        thread_stats: &ThreadInfoStatistics,
+        name: &str,
+    ) -> (f64, usize) {
+        let mut thread_count = 0;
+        let cpu_usage_sum = thread_stats
+            .get_cpu_usages()
+            .iter()
+            .filter(|(thread_name, _)| thread_name.contains(name))
+            .fold(0, |cpu_usage_sum, (_, cpu_usage)| {
+                thread_count += 1;
+                // `cpu_usage` is in [0, 100].
+                cpu_usage_sum + cpu_usage
+            });
+        (cpu_usage_sum as f64 / 100.0, thread_count)
+    }
+
     // flush the read stats info into the recorder and check if the region needs to be split
     // according to all the stats info the recorder has collected before.
     pub fn flush(
         &mut self,
         read_stats_vec: Vec<ReadStats>,
         cpu_info_vec: Vec<Arc<RawRecords>>,
+        thread_stats: &ThreadInfoStatistics,
     ) -> (Vec<usize>, Vec<SplitInfo>) {
         let mut split_infos = vec![];
+        let mut hot_regions = vec![];
         let mut top = BinaryHeap::with_capacity(TOP_N as usize);
-        let regions_info = Self::collect_regions_info(read_stats_vec, cpu_info_vec);
 
-        for (region_id, read_info_vec) in regions_info.read_info_map {
+        let regions_info = Self::collect_regions_info(read_stats_vec, cpu_info_vec);
+        let (grpc_thread_usage, grpc_thread_count) =
+            Self::collect_thread_usage_and_count(thread_stats, "grpc_server");
+        let grpc_thread_cpu_threshold = grpc_thread_count as f64 * 0.5;
+        let (unified_read_pool_thread_usage, unified_read_pool_thread_count) =
+            Self::collect_thread_usage_and_count(thread_stats, "unified_read_po");
+        let unified_read_pool_cpu_threshold = unified_read_pool_thread_count as f64 * 0.8;
+
+        for (region_id, read_info_vec) in regions_info.read_info_map.clone() {
             let qps_prefix_sum = prefix_sum(read_info_vec.iter(), RegionReadInfo::get_read_qps);
             // region_infos is not empty, so it's safe to unwrap here.
             let qps = *qps_prefix_sum.last().unwrap();
@@ -622,7 +653,16 @@ impl AutoSplitController {
                 .with_label_values(&["read"])
                 .observe(qps as f64);
 
-            if qps < self.cfg.qps_threshold && byte < self.cfg.byte_threshold {
+            let region_cpu_usage = regions_info.get_region_cpu_usage(&region_id);
+            // 1. If the QPS and Byte do not meet the threshold, skip.
+            // 2. If the Unified Read Pool is not busy or
+            //    the Region is not hot enough (takes up 50% of the Unified Read Pool CPU times), skip.
+            if qps < self.cfg.qps_threshold
+                && byte < self.cfg.byte_threshold
+                && (unified_read_pool_thread_usage < unified_read_pool_cpu_threshold
+                    || region_cpu_usage < unified_read_pool_cpu_threshold * 0.5)
+            // TODO: make the factor configurable.
+            {
                 self.recorders.remove_entry(&region_id);
                 continue;
             }
@@ -663,6 +703,8 @@ impl AutoSplitController {
                         "region_id" => region_id,
                         "qps" => qps,
                     );
+                } else {
+                    hot_regions.push((region_id, region_cpu_usage));
                 }
                 self.recorders.remove(&region_id);
             } else {
@@ -672,6 +714,17 @@ impl AutoSplitController {
             }
 
             top.push(qps);
+        }
+
+        // Sort the hot regions by CPU usage.
+        if !hot_regions.is_empty() && grpc_thread_usage < grpc_thread_cpu_threshold {
+            hot_regions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            // Split the region on half.
+            split_infos.push(SplitInfo {
+                region_id: hot_regions[0].0,
+                split_key: vec![],
+                peer: Peer::default(),
+            });
         }
 
         (top.into_vec(), split_infos)
@@ -894,12 +947,13 @@ mod tests {
     }
 
     fn check_split(mode: &[u8], qps_stats: Vec<ReadStats>, split_keys: Vec<&[u8]>) {
-        let mut hub = AutoSplitController::new(SplitConfigManager::default());
+        let thread_stats = ThreadInfoStatistics::new();
+        let mut hub = AutoSplitController::default();
         hub.cfg.qps_threshold = 1;
         hub.cfg.sample_threshold = 0;
 
         for i in 0..10 {
-            let (_, split_infos) = hub.flush(qps_stats.clone(), vec![]);
+            let (_, split_infos) = hub.flush(qps_stats.clone(), vec![], &thread_stats);
             if (i + 1) % hub.cfg.detect_times == 0 {
                 assert_eq!(
                     split_infos.len(),
@@ -927,7 +981,8 @@ mod tests {
 
     #[test]
     fn test_sample_key_num() {
-        let mut hub = AutoSplitController::new(SplitConfigManager::default());
+        let thread_stats = ThreadInfoStatistics::new();
+        let mut hub = AutoSplitController::default();
         hub.cfg.qps_threshold = 2000;
         hub.cfg.sample_num = 2000;
         hub.cfg.sample_threshold = 0;
@@ -955,7 +1010,7 @@ mod tests {
                 );
             }
             qps_stats_vec.push(qps_stats);
-            hub.flush(qps_stats_vec, vec![]);
+            hub.flush(qps_stats_vec, vec![], &thread_stats);
         }
 
         // Test the empty key ranges.
@@ -968,7 +1023,7 @@ mod tests {
             qps_stats.add_query_num(1, &Peer::default(), KeyRange::default(), QueryKind::Get);
         }
         qps_stats_vec.push(qps_stats);
-        hub.flush(qps_stats_vec, vec![]);
+        hub.flush(qps_stats_vec, vec![], &thread_stats);
     }
 
     fn check_sample_length(key_ranges: Vec<Vec<KeyRange>>) {
@@ -1254,13 +1309,14 @@ mod tests {
 
     #[bench]
     fn hub_flush(b: &mut test::Bencher) {
+        let thread_stats = ThreadInfoStatistics::new();
         let mut other_qps_stats = vec![];
         for _i in 0..10 {
             other_qps_stats.push(default_qps_stats());
         }
         b.iter(|| {
-            let mut hub = AutoSplitController::new(SplitConfigManager::default());
-            hub.flush(other_qps_stats.clone(), vec![]);
+            let mut hub = AutoSplitController::default();
+            hub.flush(other_qps_stats.clone(), vec![], &thread_stats);
         });
     }
 

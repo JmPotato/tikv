@@ -496,6 +496,7 @@ where
                             &mut auto_split_controller,
                             &read_stats_receiver,
                             &region_cpu_info_receiver,
+                            &mut thread_stats,
                             &scheduler,
                         );
                     }
@@ -541,6 +542,7 @@ where
         auto_split_controller: &mut AutoSplitController,
         region_read_stats_receiver: &Receiver<ReadStats>,
         region_cpu_info_receiver: &Receiver<Arc<RawRecords>>,
+        thread_stats: &mut ThreadInfoStatistics,
         scheduler: &Scheduler<Task<EK, ER>>,
     ) {
         auto_split_controller.refresh_cfg();
@@ -552,7 +554,9 @@ where
         while let Ok(cpu_info) = region_cpu_info_receiver.try_recv() {
             region_cpu_infos.push(cpu_info);
         }
-        let (top, split_infos) = auto_split_controller.flush(region_read_stats, region_cpu_infos);
+        thread_stats.record();
+        let (top, split_infos) =
+            auto_split_controller.flush(region_read_stats, region_cpu_infos, thread_stats);
         auto_split_controller.clear();
         let task = Task::AutoSplit { split_infos };
         if let Err(e) = scheduler.schedule(task) {
@@ -1770,6 +1774,20 @@ where
                         if let Ok(Some(region)) =
                             pd_client.get_region_by_id(split_info.region_id).await
                         {
+                            if split_info.split_key.is_empty() {
+                                let region_id = region.get_id();
+                                let msg = CasualMessage::HalfSplitRegion {
+                                    region_epoch: region.get_region_epoch().clone(),
+                                    policy: pdpb::CheckPolicy::Approximate,
+                                    source: "load_base_split",
+                                    cb: Callback::None,
+                                };
+                                if let Err(e) = router.send(region_id, PeerMsg::CasualMessage(msg))
+                                {
+                                    error!("send load base split half split request failed"; "region_id" => region_id, "err" => ?e);
+                                }
+                                continue;
+                            }
                             Self::handle_ask_batch_split(
                                 router.clone(),
                                 scheduler.clone(),
