@@ -17,7 +17,7 @@ use pd_client::{merge_bucket_stats, new_bucket_stats, BucketMeta, BucketStat};
 use resource_metering::RawRecords;
 use tikv_util::config::Tracker;
 use tikv_util::metrics::ThreadInfoStatistics;
-use tikv_util::{debug, info, warn};
+use tikv_util::{debug, info, thd_name, warn};
 
 use crate::store::metrics::*;
 use crate::store::worker::query_stats::{is_read_query, QueryStats};
@@ -276,6 +276,7 @@ pub struct Recorder {
     pub peer: Peer,
     pub key_ranges: Vec<Vec<KeyRange>>,
     pub create_time: SystemTime,
+    pub cpu_usages: f64,
 }
 
 impl Recorder {
@@ -286,6 +287,7 @@ impl Recorder {
             peer: Peer::default(),
             key_ranges: vec![],
             create_time: SystemTime::now(),
+            cpu_usages: 0.0,
         }
     }
 
@@ -298,6 +300,10 @@ impl Recorder {
         if self.peer != *peer {
             self.peer = peer.clone();
         }
+    }
+
+    fn add_cpu_usage(&mut self, cpu_usages: f64) {
+        self.cpu_usages += cpu_usages;
     }
 
     fn is_ready(&self) -> bool {
@@ -539,6 +545,7 @@ impl RegionsInfo {
     }
 }
 
+#[derive(Debug)]
 pub struct SplitInfo {
     pub region_id: u64,
     pub split_key: Vec<u8>,
@@ -602,6 +609,7 @@ impl AutoSplitController {
         name: &str,
     ) -> (f64, usize) {
         let mut thread_count = 0;
+        let cpu_usages = thread_stats.get_cpu_usages();
         let cpu_usage_sum = thread_stats
             .get_cpu_usages()
             .iter()
@@ -628,11 +636,19 @@ impl AutoSplitController {
 
         let regions_info = Self::collect_regions_info(read_stats_vec, cpu_info_vec);
         let (grpc_thread_usage, grpc_thread_count) =
-            Self::collect_thread_usage_and_count(thread_stats, "grpc_server");
+            Self::collect_thread_usage_and_count(thread_stats, "grpc-server");
         let grpc_thread_cpu_threshold = grpc_thread_count as f64 * 0.5;
         let (unified_read_pool_thread_usage, unified_read_pool_thread_count) =
-            Self::collect_thread_usage_and_count(thread_stats, "unified_read_po");
+            Self::collect_thread_usage_and_count(thread_stats, "unified-read-po");
         let unified_read_pool_cpu_threshold = unified_read_pool_thread_count as f64 * 0.8;
+        info!("flush to load base split";
+            "grpc_thread_usage" => grpc_thread_usage,
+            "grpc_thread_count" => grpc_thread_count,
+            "grpc_thread_cpu_threshold" => grpc_thread_cpu_threshold,
+            "unified_read_pool_thread_usage" => unified_read_pool_thread_usage,
+            "unified_read_pool_thread_count" => unified_read_pool_thread_count,
+            "unified_read_pool_cpu_threshold" => unified_read_pool_cpu_threshold,
+        );
 
         for (region_id, read_info_vec) in regions_info.read_info_map.clone() {
             let qps_prefix_sum = prefix_sum(read_info_vec.iter(), RegionReadInfo::get_read_qps);
@@ -641,19 +657,20 @@ impl AutoSplitController {
             let byte = read_info_vec
                 .iter()
                 .fold(0, |flow, region_info| flow + region_info.flow.read_bytes);
+            let region_cpu_usage = regions_info.get_region_cpu_usage(&region_id);
             debug!("load base split params";
                 "region_id" => region_id,
                 "qps" => qps,
                 "qps_threshold" => self.cfg.qps_threshold,
                 "byte" => byte,
                 "byte_threshold" => self.cfg.byte_threshold,
+                "cpu_usage" => region_cpu_usage,
             );
 
             QUERY_REGION_VEC
                 .with_label_values(&["read"])
                 .observe(qps as f64);
 
-            let region_cpu_usage = regions_info.get_region_cpu_usage(&region_id);
             // 1. If the QPS and Byte do not meet the threshold, skip.
             // 2. If the Unified Read Pool is not busy or
             //    the Region is not hot enough (takes up 50% of the Unified Read Pool CPU times), skip.
@@ -675,6 +692,7 @@ impl AutoSplitController {
                 .entry(region_id)
                 .or_insert_with(|| Recorder::new(detect_times));
             recorder.update_peer(&read_info_vec[0].peer);
+            recorder.add_cpu_usage(region_cpu_usage);
 
             let key_ranges = sample(
                 self.cfg.sample_num,
@@ -704,7 +722,10 @@ impl AutoSplitController {
                         "qps" => qps,
                     );
                 } else {
-                    hot_regions.push((region_id, region_cpu_usage));
+                    LOAD_BASE_SPLIT_EVENT
+                        .with_label_values(&["cpu_hot_region"])
+                        .inc();
+                    hot_regions.push((region_id, recorder.cpu_usages));
                 }
                 self.recorders.remove(&region_id);
             } else {
@@ -718,13 +739,20 @@ impl AutoSplitController {
 
         // Sort the hot regions by CPU usage.
         if !hot_regions.is_empty() && grpc_thread_usage < grpc_thread_cpu_threshold {
+            LOAD_BASE_SPLIT_EVENT
+                .with_label_values(&["ready_to_split_hot"])
+                .inc();
             hot_regions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            // Split the region on half.
-            split_infos.push(SplitInfo {
+            let split_info = SplitInfo {
                 region_id: hot_regions[0].0,
                 split_key: vec![],
                 peer: Peer::default(),
-            });
+            };
+            info!("load base split ready_to_split_hot";
+                "split_info" => ?split_info,
+            );
+            // Split the region on half.
+            split_infos.push(split_info);
         }
 
         (top.into_vec(), split_infos)
