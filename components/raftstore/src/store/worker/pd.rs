@@ -1778,7 +1778,7 @@ where
                                 let region_id = region.get_id();
                                 let msg = CasualMessage::HalfSplitRegion {
                                     region_epoch: region.get_region_epoch().clone(),
-                                    policy: pdpb::CheckPolicy::Approximate,
+                                    policy: pdpb::CheckPolicy::Scan,
                                     source: "load_base_split",
                                     cb: Callback::None,
                                 };

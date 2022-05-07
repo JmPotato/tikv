@@ -17,7 +17,7 @@ use pd_client::{merge_bucket_stats, new_bucket_stats, BucketMeta, BucketStat};
 use resource_metering::RawRecords;
 use tikv_util::config::Tracker;
 use tikv_util::metrics::ThreadInfoStatistics;
-use tikv_util::{debug, info, thd_name, warn};
+use tikv_util::{debug, info, warn};
 
 use crate::store::metrics::*;
 use crate::store::worker::query_stats::{is_read_query, QueryStats};
@@ -609,7 +609,6 @@ impl AutoSplitController {
         name: &str,
     ) -> (f64, usize) {
         let mut thread_count = 0;
-        let cpu_usages = thread_stats.get_cpu_usages();
         let cpu_usage_sum = thread_stats
             .get_cpu_usages()
             .iter()
@@ -638,8 +637,9 @@ impl AutoSplitController {
         let (grpc_thread_usage, grpc_thread_count) =
             Self::collect_thread_usage_and_count(thread_stats, "grpc-server");
         let grpc_thread_cpu_threshold = grpc_thread_count as f64 * 0.5;
-        let (unified_read_pool_thread_usage, unified_read_pool_thread_count) =
+        let (unified_read_pool_thread_usage, _) =
             Self::collect_thread_usage_and_count(thread_stats, "unified-read-po");
+        let unified_read_pool_thread_count: usize = 5;
         let unified_read_pool_cpu_threshold = unified_read_pool_thread_count as f64 * 0.8;
         info!("flush to load base split";
             "grpc_thread_usage" => grpc_thread_usage,
@@ -725,7 +725,7 @@ impl AutoSplitController {
                     LOAD_BASE_SPLIT_EVENT
                         .with_label_values(&["cpu_hot_region"])
                         .inc();
-                    hot_regions.push((region_id, recorder.cpu_usages));
+                    hot_regions.push((region_id, recorder.cpu_usages, recorder.peer.clone()));
                 }
                 self.recorders.remove(&region_id);
             } else {
@@ -746,7 +746,7 @@ impl AutoSplitController {
             let split_info = SplitInfo {
                 region_id: hot_regions[0].0,
                 split_key: vec![],
-                peer: Peer::default(),
+                peer: hot_regions[0].2.clone(),
             };
             info!("load base split ready_to_split_hot";
                 "split_info" => ?split_info,
