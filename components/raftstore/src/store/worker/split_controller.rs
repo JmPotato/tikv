@@ -822,12 +822,14 @@ impl AutoSplitController {
             top.push(qps);
         }
 
-        if grpc_thread_usage < grpc_thread_cpu_threshold {
-            hot_regions.sort_by(|a, b| {
-                let cpu_usage_a = self.recorders.get(a).unwrap().cpu_usage;
-                let cpu_usage_b = self.recorders.get(b).unwrap().cpu_usage;
-                cpu_usage_b.partial_cmp(&cpu_usage_a).unwrap()
-            });
+        if !hot_regions.is_empty() && grpc_thread_usage < grpc_thread_cpu_threshold {
+            if hot_regions.len() > 1 {
+                hot_regions.sort_by(|a, b| {
+                    let cpu_usage_a = self.recorders.get(a).unwrap().cpu_usage;
+                    let cpu_usage_b = self.recorders.get(b).unwrap().cpu_usage;
+                    cpu_usage_b.partial_cmp(&cpu_usage_a).unwrap()
+                });
+            }
             let region_id = hot_regions[0];
             let recorder = self.recorders.get_mut(&region_id).unwrap();
             let key = recorder.collect(&self.cfg, true);
