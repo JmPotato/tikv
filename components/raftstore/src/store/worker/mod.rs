@@ -38,4 +38,7 @@ pub use self::split_check::{
     Bucket, BucketRange, KeyEntry, Runner as SplitCheckRunner, Task as SplitCheckTask,
 };
 pub use self::split_config::{SplitConfig, SplitConfigManager};
-pub use self::split_controller::{AutoSplitController, ReadStats, WriteStats};
+pub use self::split_controller::{
+    build_key_range_info, AutoSplitController, KeyRangeInfo, ReadStats, ReservoirSampler,
+    WriteStats,
+};

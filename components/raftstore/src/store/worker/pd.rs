@@ -1774,20 +1774,6 @@ where
                         if let Ok(Some(region)) =
                             pd_client.get_region_by_id(split_info.region_id).await
                         {
-                            if split_info.split_key.is_empty() {
-                                let region_id = region.get_id();
-                                let msg = CasualMessage::HalfSplitRegion {
-                                    region_epoch: region.get_region_epoch().clone(),
-                                    policy: pdpb::CheckPolicy::Scan,
-                                    source: "load_base_split",
-                                    cb: Callback::None,
-                                };
-                                if let Err(e) = router.send(region_id, PeerMsg::CasualMessage(msg))
-                                {
-                                    error!("send load base split half split request failed"; "region_id" => region_id, "err" => ?e);
-                                }
-                                continue;
-                            }
                             Self::handle_ask_batch_split(
                                 router.clone(),
                                 scheduler.clone(),

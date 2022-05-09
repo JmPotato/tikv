@@ -65,8 +65,9 @@ pub use self::txn_ext::{LocksStatus, PeerPessimisticLocks, PessimisticLockPair, 
 pub use self::util::{RegionReadProgress, RegionReadProgressRegistry};
 pub use self::worker::RefreshConfigTask;
 pub use self::worker::{
-    AutoSplitController, FlowStatistics, FlowStatsReporter, PdTask, QueryStats, ReadDelegate,
-    ReadStats, SplitConfig, SplitConfigManager, TrackVer, WriteStats,
+    build_key_range_info, AutoSplitController, FlowStatistics, FlowStatsReporter, KeyRangeInfo,
+    PdTask, QueryStats, ReadDelegate, ReadStats, ReservoirSampler, SplitConfig, SplitConfigManager,
+    TrackVer, WriteStats,
 };
 pub use self::worker::{Bucket, BucketRange, KeyEntry, LocalReader, RegionTask};
 pub use self::worker::{CheckLeaderRunner, CheckLeaderTask};

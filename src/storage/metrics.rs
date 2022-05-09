@@ -12,12 +12,10 @@ use std::sync::Arc;
 use crate::server::metrics::{GcKeysCF as ServerGcKeysCF, GcKeysDetail as ServerGcKeysDetail};
 use crate::storage::kv::{FlowStatsReporter, PerfStatisticsDelta, Statistics};
 use collections::HashMap;
-use kvproto::kvrpcpb::KeyRange;
 use kvproto::metapb;
 use kvproto::pdpb::QueryKind;
 use pd_client::BucketMeta;
-use raftstore::store::util::build_key_range;
-use raftstore::store::ReadStats;
+use raftstore::store::{build_key_range_info, KeyRangeInfo, ReadStats};
 
 struct StorageLocalMetrics {
     local_scan_details: HashMap<CommandKind, Statistics>,
@@ -160,22 +158,22 @@ pub fn tls_collect_query(
 ) {
     TLS_STORAGE_METRICS.with(|m| {
         let mut m = m.borrow_mut();
-        let key_range = build_key_range(start_key, end_key, reverse_scan);
+        let key_range_info = build_key_range_info(start_key, end_key, reverse_scan, vec![]);
         m.local_read_stats
-            .add_query_num(region_id, peer, key_range, kind);
+            .add_query_num(region_id, peer, key_range_info, kind);
     });
 }
 
 pub fn tls_collect_query_batch(
     region_id: u64,
     peer: &metapb::Peer,
-    key_ranges: Vec<KeyRange>,
+    key_range_infos: Vec<KeyRangeInfo>,
     kind: QueryKind,
 ) {
     TLS_STORAGE_METRICS.with(|m| {
         let mut m = m.borrow_mut();
         m.local_read_stats
-            .add_query_num_batch(region_id, peer, key_ranges, kind);
+            .add_query_num_batch(region_id, peer, key_range_infos, kind);
     });
 }
 

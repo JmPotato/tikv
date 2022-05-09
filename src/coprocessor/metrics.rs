@@ -9,8 +9,8 @@ use collections::HashMap;
 use kvproto::metapb;
 use kvproto::pdpb::QueryKind;
 use pd_client::BucketMeta;
-use raftstore::store::util::build_key_range;
-use raftstore::store::ReadStats;
+use raftstore::store::{build_key_range_info, ReadStats, ReservoirSampler};
+use txn_types::Key;
 
 use crate::server::metrics::{GcKeysCF, GcKeysDetail};
 use prometheus::*;
@@ -268,6 +268,7 @@ pub struct CopLocalMetrics {
     local_scan_details: HashMap<ReqTag, Statistics>,
     local_read_stats: ReadStats,
     local_perf_stats: HashMap<ReqTag, PerfStatisticsDelta>,
+    local_sampled_scan_keys: ReservoirSampler<Vec<u8>>,
 }
 
 thread_local! {
@@ -276,6 +277,7 @@ thread_local! {
             local_scan_details: HashMap::default(),
             local_read_stats: ReadStats::default(),
             local_perf_stats: HashMap::default(),
+            local_sampled_scan_keys: ReservoirSampler::default(),
         }
     );
 }
@@ -434,7 +436,13 @@ pub fn tls_collect_query(
 ) {
     TLS_COP_METRICS.with(|m| {
         let mut m = m.borrow_mut();
-        let key_range = build_key_range(start_key, end_key, reverse_scan);
+        let key_range = build_key_range_info(
+            start_key,
+            end_key,
+            reverse_scan,
+            m.local_sampled_scan_keys.results().clone(),
+        );
+        m.local_sampled_scan_keys.clear();
         m.local_read_stats
             .add_query_num(region_id, peer, key_range, QueryKind::Coprocessor);
     });
@@ -446,5 +454,12 @@ pub fn tls_collect_perf_stats(cmd: ReqTag, perf_stats: &PerfStatisticsDelta) {
             .local_perf_stats
             .entry(cmd)
             .or_insert_with(Default::default)) += *perf_stats;
+    });
+}
+
+pub fn tls_collect_sampled_scan_key(key: &Key) {
+    TLS_COP_METRICS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.local_sampled_scan_keys.sample(key.as_encoded().to_vec());
     });
 }

@@ -92,8 +92,7 @@ use kvproto::kvrpcpb::{
 };
 use kvproto::pdpb::QueryKind;
 use pd_client::FeatureGate;
-use raftstore::store::{util::build_key_range, TxnExt};
-use raftstore::store::{ReadStats, WriteStats};
+use raftstore::store::{build_key_range_info, ReadStats, TxnExt, WriteStats};
 use rand::prelude::*;
 use resource_metering::{FutureExt, ResourceTagFactory};
 use std::marker::PhantomData;
@@ -885,14 +884,19 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let res = self.read_pool.spawn_handle(
             async move {
                 let stage_scheduled_ts = Instant::now_coarse();
-                let mut key_ranges = vec![];
+                let mut key_range_infos = vec![];
                 for key in &keys {
-                    key_ranges.push(build_key_range(key.as_encoded(), key.as_encoded(), false));
+                    key_range_infos.push(build_key_range_info(
+                        key.as_encoded(),
+                        key.as_encoded(),
+                        false,
+                        vec![],
+                    ));
                 }
                 tls_collect_query_batch(
                     ctx.get_region_id(),
                     ctx.get_peer(),
-                    key_ranges,
+                    key_range_infos,
                     QueryKind::Get,
                 );
 
@@ -1680,7 +1684,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
 
         let res = self.read_pool.spawn_handle(
             async move {
-                let mut key_ranges = vec![];
+                let mut key_range_infos = vec![];
                 KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
                 SCHED_COMMANDS_PRI_COUNTER_VEC_STATIC
                     .get(priority_tag)
@@ -1717,7 +1721,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                                 buckets.as_ref(),
                             );
                             stats.add(&s);
-                            key_ranges.push(build_key_range(k.as_encoded(), k.as_encoded(), false));
+                            key_range_infos.push(build_key_range_info(
+                                k.as_encoded(),
+                                k.as_encoded(),
+                                false,
+                                vec![],
+                            ));
                             (k, v)
                         })
                         .filter(|&(_, ref v)| !(v.is_ok() && v.as_ref().unwrap().is_none()))
@@ -1733,7 +1742,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     tls_collect_query_batch(
                         ctx.get_region_id(),
                         ctx.get_peer(),
-                        key_ranges,
+                        key_range_infos,
                         QueryKind::Get,
                     );
                     KV_COMMAND_KEYREAD_HISTOGRAM_STATIC
@@ -2176,7 +2185,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         return Err(box_err!("Invalid KeyRanges"));
                     };
                     let mut result = Vec::new();
-                    let mut key_ranges = vec![];
+                    let mut key_range_infos = vec![];
                     let ranges_len = ranges.len();
 
                     for i in 0..ranges_len {
@@ -2231,10 +2240,11 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                         })
                         .map_err(Error::from)?;
 
-                        key_ranges.push(build_key_range(
+                        key_range_infos.push(build_key_range_info(
                             start_key.as_encoded(),
                             end_key.as_ref().map(|k| k.as_encoded()).unwrap_or(&vec![]),
                             reverse_scan,
+                            vec![],
                         ));
                         metrics::tls_collect_read_flow(
                             ctx.get_region_id(),
@@ -2250,7 +2260,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                     tls_collect_query_batch(
                         ctx.get_region_id(),
                         ctx.get_peer(),
-                        key_ranges,
+                        key_range_infos,
                         QueryKind::Scan,
                     );
                     KV_COMMAND_KEYREAD_HISTOGRAM_STATIC

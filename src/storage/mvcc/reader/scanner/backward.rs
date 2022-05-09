@@ -8,6 +8,7 @@ use kvproto::kvrpcpb::IsolationLevel;
 use txn_types::{Key, Lock, TimeStamp, Value, Write, WriteRef, WriteType};
 
 use super::ScannerConfig;
+use crate::coprocessor::metrics::tls_collect_sampled_scan_key;
 use crate::storage::kv::{Cursor, Snapshot, Statistics, SEEK_BOUND};
 use crate::storage::mvcc::ErrorInner::WriteConflict;
 use crate::storage::mvcc::{Error, NewerTsCheckState, Result};
@@ -212,6 +213,7 @@ impl<S: Snapshot> BackwardKvScanner<S> {
                 self.statistics.write.processed_keys += 1;
                 self.statistics.processed_size += current_user_key.len() + v.len();
                 resource_metering::record_read_keys(1);
+                tls_collect_sampled_scan_key(&current_user_key);
                 return Ok(Some((current_user_key, v)));
             }
         }

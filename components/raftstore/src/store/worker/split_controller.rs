@@ -10,7 +10,6 @@ use std::time::{Duration, SystemTime};
 
 use rand::Rng;
 
-use kvproto::kvrpcpb::KeyRange;
 use kvproto::metapb::{self, Peer};
 use kvproto::pdpb::QueryKind;
 use pd_client::{merge_bucket_stats, new_bucket_stats, BucketMeta, BucketStat};
@@ -79,9 +78,9 @@ fn sample<F, T>(
     sample_num: usize,
     mut key_ranges_providers: Vec<T>,
     key_ranges_getter: F,
-) -> Vec<KeyRange>
+) -> Vec<KeyRangeInfo>
 where
-    F: Fn(&mut T) -> &mut Vec<KeyRange>,
+    F: Fn(&mut T) -> &mut Vec<KeyRangeInfo>,
 {
     let mut sampled_key_ranges = vec![];
     // Retain the non-empty key ranges.
@@ -143,6 +142,55 @@ where
     sampled_key_ranges
 }
 
+// ReservoirSampler is a struct to sample the set number of items from a stream with the same possibility.
+#[derive(Clone, Debug)]
+pub struct ReservoirSampler<T> {
+    sample_num: usize,
+    results: Vec<T>,
+}
+
+impl<T: Clone> ReservoirSampler<T> {
+    pub fn new(sample_num: usize) -> Self {
+        Self {
+            sample_num,
+            results: Vec::with_capacity(sample_num),
+        }
+    }
+
+    pub fn sample(&mut self, item: T) {
+        if self.results.len() < self.sample_num {
+            self.results.push(item);
+        } else {
+            let i = rand::thread_rng().gen_range(0..self.sample_num);
+            if i < self.results.len() {
+                self.results[i] = item;
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.results.clear();
+    }
+
+    pub fn results(&self) -> &Vec<T> {
+        &self.results
+    }
+
+    fn results_mut(&mut self) -> &mut Vec<T> {
+        &mut self.results
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.results.is_empty()
+    }
+}
+
+impl<T: Clone> Default for ReservoirSampler<T> {
+    fn default() -> Self {
+        ReservoirSampler::<T>::new(get_sample_num())
+    }
+}
+
 pub struct Sample {
     pub key: Vec<u8>,
     // left means the number of key ranges located on the sample's left.
@@ -166,8 +214,8 @@ impl Sample {
 
 struct Samples(Vec<Sample>);
 
-impl From<Vec<KeyRange>> for Samples {
-    fn from(key_ranges: Vec<KeyRange>) -> Self {
+impl From<Vec<KeyRangeInfo>> for Samples {
+    fn from(key_ranges: Vec<KeyRangeInfo>) -> Self {
         Samples(
             key_ranges
                 .iter()
@@ -185,7 +233,7 @@ impl From<Vec<KeyRange>> for Samples {
 
 impl Samples {
     // evaluate the samples according to the given key range, it will update the sample's left, right and contained counter.
-    fn evaluate(&mut self, key_range: &KeyRange) {
+    fn evaluate(&mut self, key_range: &KeyRangeInfo, with_scanned_keys: bool) {
         for mut sample in self.0.iter_mut() {
             let order_start = if key_range.start_key.is_empty() {
                 Ordering::Greater
@@ -205,6 +253,18 @@ impl Samples {
                 sample.right += 1;
             } else {
                 sample.left += 1;
+            }
+
+            if !with_scanned_keys {
+                continue;
+            }
+
+            for key in key_range.scanned_keys.iter() {
+                match sample.key.cmp(key) {
+                    Ordering::Greater => sample.left += 1,
+                    Ordering::Less => sample.right += 1,
+                    _ => continue,
+                }
             }
         }
     }
@@ -274,9 +334,9 @@ pub struct Recorder {
     pub detect_times: u64,
     pub detected_times: u64,
     pub peer: Peer,
-    pub key_ranges: Vec<Vec<KeyRange>>,
+    pub key_ranges: Vec<Vec<KeyRangeInfo>>,
     pub create_time: SystemTime,
-    pub cpu_usages: f64,
+    pub cpu_usage: f64,
 }
 
 impl Recorder {
@@ -287,11 +347,11 @@ impl Recorder {
             peer: Peer::default(),
             key_ranges: vec![],
             create_time: SystemTime::now(),
-            cpu_usages: 0.0,
+            cpu_usage: 0.0,
         }
     }
 
-    fn record(&mut self, key_ranges: Vec<KeyRange>) {
+    fn record(&mut self, key_ranges: Vec<KeyRangeInfo>) {
         self.detected_times += 1;
         self.key_ranges.push(key_ranges);
     }
@@ -302,8 +362,8 @@ impl Recorder {
         }
     }
 
-    fn add_cpu_usage(&mut self, cpu_usages: f64) {
-        self.cpu_usages += cpu_usages;
+    fn add_cpu_usage(&mut self, cpu_usage: f64) {
+        self.cpu_usage += cpu_usage;
     }
 
     fn is_ready(&self) -> bool {
@@ -313,10 +373,10 @@ impl Recorder {
     // collect the split keys from the recorded key_ranges.
     // This will start a second-level sampling on the previous sampled key ranges,
     // evaluate the samples according to the given key range, and compute the split keys finally.
-    fn collect(&self, config: &SplitConfig) -> Vec<u8> {
+    fn collect(&self, config: &SplitConfig, with_scanned_keys: bool) -> Vec<u8> {
         let sampled_key_ranges = sample(config.sample_num, self.key_ranges.clone(), |x| x);
         let mut samples = Samples::from(sampled_key_ranges);
-        let recorded_key_ranges: Vec<&KeyRange> = self.key_ranges.iter().flatten().collect();
+        let recorded_key_ranges: Vec<&KeyRangeInfo> = self.key_ranges.iter().flatten().collect();
         // Because we need to observe the number of `no_enough_key` of all the actual keys,
         // so we do this check after the samples are calculated.
         if (recorded_key_ranges.len() as u64) < config.sample_threshold {
@@ -326,10 +386,36 @@ impl Recorder {
             return vec![];
         }
         recorded_key_ranges.into_iter().for_each(|key_range| {
-            samples.evaluate(key_range);
+            samples.evaluate(key_range, with_scanned_keys);
         });
         samples.split_key(config.split_balance_score, config.split_contained_score)
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct KeyRangeInfo {
+    pub start_key: Vec<u8>,
+    pub end_key: Vec<u8>,
+    pub scanned_keys: Vec<Vec<u8>>,
+}
+
+#[inline]
+pub fn build_key_range_info(
+    start_key: &[u8],
+    end_key: &[u8],
+    reverse_scan: bool,
+    scanned_keys: Vec<Vec<u8>>,
+) -> KeyRangeInfo {
+    let mut key_range_info = KeyRangeInfo::default();
+    if reverse_scan {
+        key_range_info.start_key = end_key.to_vec();
+        key_range_info.end_key = start_key.to_vec();
+    } else {
+        key_range_info.start_key = start_key.to_vec();
+        key_range_info.end_key = end_key.to_vec();
+    }
+    key_range_info.scanned_keys = scanned_keys;
+    key_range_info
 }
 
 // RegionReadInfo will maintain `key_ranges` with `sample_num` length by reservoir sampling,
@@ -339,8 +425,8 @@ pub struct RegionReadInfo {
     pub sample_num: usize,
     pub query_stats: QueryStats,
     pub peer: Peer,
-    pub key_ranges: Vec<KeyRange>,
     pub flow: FlowStatistics,
+    key_ranges: ReservoirSampler<KeyRangeInfo>,
 }
 
 impl RegionReadInfo {
@@ -348,9 +434,9 @@ impl RegionReadInfo {
         RegionReadInfo {
             sample_num,
             query_stats: QueryStats::default(),
-            key_ranges: Vec::with_capacity(sample_num),
             peer: Peer::default(),
             flow: FlowStatistics::default(),
+            key_ranges: ReservoirSampler::new(sample_num),
         }
     }
 
@@ -358,21 +444,18 @@ impl RegionReadInfo {
         self.query_stats.get_read_query_num() as usize
     }
 
-    fn get_key_ranges_mut(&mut self) -> &mut Vec<KeyRange> {
-        &mut self.key_ranges
+    #[allow(dead_code)]
+    fn get_key_ranges(&self) -> &Vec<KeyRangeInfo> {
+        self.key_ranges.results()
     }
 
-    fn add_key_ranges(&mut self, key_ranges: Vec<KeyRange>) {
-        for (i, key_range) in key_ranges.into_iter().enumerate() {
-            let n = self.get_read_qps() + i;
-            if n == 0 || self.key_ranges.len() < self.sample_num {
-                self.key_ranges.push(key_range);
-            } else {
-                let j = rand::thread_rng().gen_range(0..n) as usize;
-                if j < self.sample_num {
-                    self.key_ranges[j] = key_range;
-                }
-            }
+    fn get_key_ranges_mut(&mut self) -> &mut Vec<KeyRangeInfo> {
+        self.key_ranges.results_mut()
+    }
+
+    fn add_key_ranges(&mut self, key_ranges: Vec<KeyRangeInfo>) {
+        for key_range in key_ranges.into_iter() {
+            self.key_ranges.sample(key_range);
         }
     }
 
@@ -414,7 +497,7 @@ impl ReadStats {
         &mut self,
         region_id: u64,
         peer: &Peer,
-        key_range: KeyRange,
+        key_range: KeyRangeInfo,
         kind: QueryKind,
     ) {
         self.add_query_num_batch(region_id, peer, vec![key_range], kind);
@@ -424,7 +507,7 @@ impl ReadStats {
         &mut self,
         region_id: u64,
         peer: &Peer,
-        key_ranges: Vec<KeyRange>,
+        key_ranges: Vec<KeyRangeInfo>,
         kind: QueryKind,
     ) {
         let sample_num = self.sample_num;
@@ -641,7 +724,7 @@ impl AutoSplitController {
             Self::collect_thread_usage_and_count(thread_stats, "unified-read-po");
         let unified_read_pool_thread_count: usize = 5;
         let unified_read_pool_cpu_threshold = unified_read_pool_thread_count as f64 * 0.8;
-        info!("flush to load base split";
+        debug!("flush to load base split";
             "grpc_thread_usage" => grpc_thread_usage,
             "grpc_thread_count" => grpc_thread_count,
             "grpc_thread_cpu_threshold" => grpc_thread_cpu_threshold,
@@ -707,7 +790,7 @@ impl AutoSplitController {
             }
             recorder.record(key_ranges);
             if recorder.is_ready() {
-                let key = recorder.collect(&self.cfg);
+                let key = recorder.collect(&self.cfg, false);
                 if !key.is_empty() {
                     split_infos.push(SplitInfo {
                         region_id,
@@ -720,14 +803,16 @@ impl AutoSplitController {
                     info!("load base split region";
                         "region_id" => region_id,
                         "qps" => qps,
+                        "byte" => byte,
+                        "cpu_usage" => region_cpu_usage,
                     );
+                    self.recorders.remove(&region_id);
                 } else {
                     LOAD_BASE_SPLIT_EVENT
                         .with_label_values(&["cpu_hot_region"])
                         .inc();
-                    hot_regions.push((region_id, recorder.cpu_usages, recorder.peer.clone()));
+                    hot_regions.push(region_id);
                 }
-                self.recorders.remove(&region_id);
             } else {
                 LOAD_BASE_SPLIT_EVENT
                     .with_label_values(&[NOT_READY_TO_SPLIT])
@@ -737,22 +822,33 @@ impl AutoSplitController {
             top.push(qps);
         }
 
-        // Sort the hot regions by CPU usage.
-        if !hot_regions.is_empty() && grpc_thread_usage < grpc_thread_cpu_threshold {
-            LOAD_BASE_SPLIT_EVENT
-                .with_label_values(&["ready_to_split_hot"])
-                .inc();
-            hot_regions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            let split_info = SplitInfo {
-                region_id: hot_regions[0].0,
-                split_key: vec![],
-                peer: hot_regions[0].2.clone(),
-            };
-            info!("load base split ready_to_split_hot";
-                "split_info" => ?split_info,
-            );
-            // Split the region on half.
-            split_infos.push(split_info);
+        if grpc_thread_usage < grpc_thread_cpu_threshold {
+            hot_regions.sort_by(|a, b| {
+                let cpu_usage_a = self.recorders.get(a).unwrap().cpu_usage;
+                let cpu_usage_b = self.recorders.get(b).unwrap().cpu_usage;
+                cpu_usage_b.partial_cmp(&cpu_usage_a).unwrap()
+            });
+            let region_id = hot_regions[0];
+            let recorder = self.recorders.get_mut(&region_id).unwrap();
+            let key = recorder.collect(&self.cfg, true);
+            if !key.is_empty() {
+                split_infos.push(SplitInfo {
+                    region_id,
+                    split_key: key,
+                    peer: recorder.peer.clone(),
+                });
+                LOAD_BASE_SPLIT_EVENT
+                    .with_label_values(&["ready_to_split_hot"])
+                    .inc();
+                info!("load base split region";
+                    "region_id" => region_id,
+                    "cpu_usage" => recorder.cpu_usage,
+                );
+            }
+        }
+
+        for region_id in hot_regions {
+            self.recorders.remove(&region_id);
         }
 
         (top.into_vec(), split_infos)
@@ -779,7 +875,6 @@ mod tests {
     use super::*;
     use txn_types::Key;
 
-    use crate::store::util::build_key_range;
     use crate::store::worker::split_config::DEFAULT_SAMPLE_NUM;
 
     enum Position {
@@ -805,8 +900,8 @@ mod tests {
     impl SampleCase {
         fn sample_key(&self, start_key: &[u8], end_key: &[u8], pos: Position) {
             let mut samples = Samples(vec![Sample::new(&self.key)]);
-            let key_range = build_key_range(start_key, end_key, false);
-            samples.evaluate(&key_range);
+            let key_range_info = build_key_range_info(start_key, end_key, false, vec![]);
+            samples.evaluate(&key_range_info, false);
             assert_eq!(
                 samples.0[0].num(pos),
                 1,
@@ -853,7 +948,7 @@ mod tests {
         sc.sample_key(b"", b"d", Position::Contained);
     }
 
-    fn gen_read_stats(region_id: u64, key_ranges: Vec<KeyRange>) -> ReadStats {
+    fn gen_read_stats(region_id: u64, key_ranges: Vec<KeyRangeInfo>) -> ReadStats {
         let mut qps_stats = ReadStats::default();
         for key_range in &key_ranges {
             qps_stats.add_query_num(
@@ -876,12 +971,12 @@ mod tests {
         for _ in 0..config.detect_times {
             assert!(!recorder.is_ready());
             recorder.record(vec![
-                build_key_range(b"a", b"b", false),
-                build_key_range(b"b", b"c", false),
+                build_key_range_info(b"a", b"b", false, vec![]),
+                build_key_range_info(b"b", b"c", false, vec![]),
             ]);
         }
         assert!(recorder.is_ready());
-        let key = recorder.collect(&config);
+        let key = recorder.collect(&config, false);
         assert_eq!(key, b"b");
     }
 
@@ -889,8 +984,8 @@ mod tests {
     fn test_hub() {
         // raw key mode
         let raw_key_ranges = vec![
-            build_key_range(b"a", b"b", false),
-            build_key_range(b"b", b"c", false),
+            build_key_range_info(b"a", b"b", false, vec![]),
+            build_key_range_info(b"b", b"c", false, vec![]),
         ];
         check_split(
             b"raw key",
@@ -903,8 +998,8 @@ mod tests {
         let key_b = Key::from_raw(b"0160").append_ts(2.into());
         let key_c = Key::from_raw(b"0240").append_ts(2.into());
         let encoded_key_ranges = vec![
-            build_key_range(key_a.as_encoded(), key_b.as_encoded(), false),
-            build_key_range(key_b.as_encoded(), key_c.as_encoded(), false),
+            build_key_range_info(key_a.as_encoded(), key_b.as_encoded(), false, vec![]),
+            build_key_range_info(key_b.as_encoded(), key_c.as_encoded(), false, vec![]),
         ];
         check_split(
             b"encoded key",
@@ -925,12 +1020,12 @@ mod tests {
         // test distribution with contained key
         for _i in 0..100 {
             let key_ranges = vec![
-                build_key_range(b"a", b"k", false),
-                build_key_range(b"b", b"j", false),
-                build_key_range(b"c", b"i", false),
-                build_key_range(b"d", b"h", false),
-                build_key_range(b"e", b"g", false),
-                build_key_range(b"f", b"f", false),
+                build_key_range_info(b"a", b"k", false, vec![]),
+                build_key_range_info(b"b", b"j", false, vec![]),
+                build_key_range_info(b"c", b"i", false, vec![]),
+                build_key_range_info(b"d", b"h", false, vec![]),
+                build_key_range_info(b"e", b"g", false, vec![]),
+                build_key_range_info(b"f", b"f", false, vec![]),
             ];
             check_split(
                 b"isosceles triangle",
@@ -939,12 +1034,12 @@ mod tests {
             );
 
             let key_ranges = vec![
-                build_key_range(b"a", b"f", false),
-                build_key_range(b"b", b"g", false),
-                build_key_range(b"c", b"h", false),
-                build_key_range(b"d", b"i", false),
-                build_key_range(b"e", b"j", false),
-                build_key_range(b"f", b"k", false),
+                build_key_range_info(b"a", b"f", false, vec![]),
+                build_key_range_info(b"b", b"g", false, vec![]),
+                build_key_range_info(b"c", b"h", false, vec![]),
+                build_key_range_info(b"d", b"i", false, vec![]),
+                build_key_range_info(b"e", b"j", false, vec![]),
+                build_key_range_info(b"f", b"k", false, vec![]),
             ];
             check_split(
                 b"parallelogram",
@@ -953,8 +1048,8 @@ mod tests {
             );
 
             let key_ranges = vec![
-                build_key_range(b"a", b"l", false),
-                build_key_range(b"a", b"m", false),
+                build_key_range_info(b"a", b"l", false, vec![]),
+                build_key_range_info(b"a", b"m", false, vec![]),
             ];
             check_split(
                 b"right-angle trapezoid",
@@ -963,8 +1058,8 @@ mod tests {
             );
 
             let key_ranges = vec![
-                build_key_range(b"a", b"l", false),
-                build_key_range(b"b", b"l", false),
+                build_key_range_info(b"a", b"l", false, vec![]),
+                build_key_range_info(b"b", b"l", false, vec![]),
             ];
             check_split(
                 b"right-angle trapezoid",
@@ -1023,7 +1118,7 @@ mod tests {
             qps_stats.add_query_num(
                 1,
                 &Peer::default(),
-                build_key_range(b"a", b"b", false),
+                build_key_range_info(b"a", b"b", false, vec![]),
                 QueryKind::Get,
             );
             qps_stats_vec.push(qps_stats);
@@ -1033,7 +1128,7 @@ mod tests {
                 qps_stats.add_query_num(
                     1,
                     &Peer::default(),
-                    build_key_range(b"b", b"c", false),
+                    build_key_range_info(b"b", b"c", false, vec![]),
                     QueryKind::Get,
                 );
             }
@@ -1044,17 +1139,17 @@ mod tests {
         // Test the empty key ranges.
         let mut qps_stats_vec = vec![];
         let mut qps_stats = ReadStats::with_sample_num(hub.cfg.sample_num);
-        qps_stats.add_query_num(1, &Peer::default(), KeyRange::default(), QueryKind::Get);
+        qps_stats.add_query_num(1, &Peer::default(), KeyRangeInfo::default(), QueryKind::Get);
         qps_stats_vec.push(qps_stats);
         let mut qps_stats = ReadStats::with_sample_num(hub.cfg.sample_num);
         for _ in 0..2000 {
-            qps_stats.add_query_num(1, &Peer::default(), KeyRange::default(), QueryKind::Get);
+            qps_stats.add_query_num(1, &Peer::default(), KeyRangeInfo::default(), QueryKind::Get);
         }
         qps_stats_vec.push(qps_stats);
         hub.flush(qps_stats_vec, vec![], &thread_stats);
     }
 
-    fn check_sample_length(key_ranges: Vec<Vec<KeyRange>>) {
+    fn check_sample_length(key_ranges: Vec<Vec<KeyRangeInfo>>) {
         for sample_num in 0..=DEFAULT_SAMPLE_NUM {
             for _ in 0..100 {
                 let sampled_key_ranges = sample(sample_num, key_ranges.clone(), |x| x);
@@ -1072,14 +1167,14 @@ mod tests {
         // Test the sample_num = key range number.
         let mut key_ranges = vec![];
         for _ in 0..DEFAULT_SAMPLE_NUM {
-            key_ranges.push(vec![build_key_range(b"a", b"b", false)]);
+            key_ranges.push(vec![build_key_range_info(b"a", b"b", false, vec![])]);
         }
         check_sample_length(key_ranges);
 
         // Test the sample_num < key range number.
         let mut key_ranges = vec![];
         for _ in 0..DEFAULT_SAMPLE_NUM + 1 {
-            key_ranges.push(vec![build_key_range(b"a", b"b", false)]);
+            key_ranges.push(vec![build_key_range_info(b"a", b"b", false, vec![])]);
         }
         check_sample_length(key_ranges);
 
@@ -1088,18 +1183,18 @@ mod tests {
         for _ in 0..num {
             let mut ranges = vec![];
             for _ in 0..num {
-                ranges.push(build_key_range(b"a", b"b", false));
+                ranges.push(build_key_range_info(b"a", b"b", false, vec![]));
             }
             key_ranges.push(ranges);
         }
         check_sample_length(key_ranges);
 
         // Test the sample_num > key range number.
-        check_sample_length(vec![vec![build_key_range(b"a", b"b", false)]]);
+        check_sample_length(vec![vec![build_key_range_info(b"a", b"b", false, vec![])]]);
 
         let mut key_ranges = vec![];
         for _ in 0..DEFAULT_SAMPLE_NUM - 1 {
-            key_ranges.push(vec![build_key_range(b"a", b"b", false)]);
+            key_ranges.push(vec![build_key_range_info(b"a", b"b", false, vec![])]);
         }
         check_sample_length(key_ranges);
 
@@ -1109,86 +1204,86 @@ mod tests {
             // Case 1: small gap.
             vec![
                 vec![],
-                vec![build_key_range(b"a", b"b", false)],
-                vec![build_key_range(b"a", b"b", false)],
-                vec![build_key_range(b"a", b"b", false)],
+                vec![build_key_range_info(b"a", b"b", false, vec![])],
+                vec![build_key_range_info(b"a", b"b", false, vec![])],
+                vec![build_key_range_info(b"a", b"b", false, vec![])],
             ],
             vec![
-                vec![build_key_range(b"a", b"b", false)],
+                vec![build_key_range_info(b"a", b"b", false, vec![])],
                 vec![],
-                vec![build_key_range(b"a", b"b", false)],
-                vec![build_key_range(b"a", b"b", false)],
+                vec![build_key_range_info(b"a", b"b", false, vec![])],
+                vec![build_key_range_info(b"a", b"b", false, vec![])],
             ],
             vec![
-                vec![build_key_range(b"a", b"b", false)],
-                vec![build_key_range(b"a", b"b", false)],
+                vec![build_key_range_info(b"a", b"b", false, vec![])],
+                vec![build_key_range_info(b"a", b"b", false, vec![])],
                 vec![],
-                vec![build_key_range(b"a", b"b", false)],
+                vec![build_key_range_info(b"a", b"b", false, vec![])],
             ],
             vec![
-                vec![build_key_range(b"a", b"b", false)],
-                vec![build_key_range(b"a", b"b", false)],
-                vec![build_key_range(b"a", b"b", false)],
+                vec![build_key_range_info(b"a", b"b", false, vec![])],
+                vec![build_key_range_info(b"a", b"b", false, vec![])],
+                vec![build_key_range_info(b"a", b"b", false, vec![])],
                 vec![],
             ],
             // Case 2: big gap.
             vec![
                 vec![],
                 vec![
-                    build_key_range(b"e", b"f", false),
-                    build_key_range(b"g", b"h", false),
-                    build_key_range(b"i", b"j", false),
+                    build_key_range_info(b"e", b"f", false, vec![]),
+                    build_key_range_info(b"g", b"h", false, vec![]),
+                    build_key_range_info(b"i", b"j", false, vec![]),
                 ],
-                vec![build_key_range(b"a", b"b", false)],
-                vec![build_key_range(b"c", b"d", false)],
+                vec![build_key_range_info(b"a", b"b", false, vec![])],
+                vec![build_key_range_info(b"c", b"d", false, vec![])],
             ],
             vec![
                 vec![
-                    build_key_range(b"e", b"f", false),
-                    build_key_range(b"g", b"h", false),
-                    build_key_range(b"i", b"j", false),
-                ],
-                vec![],
-                vec![build_key_range(b"a", b"b", false)],
-                vec![build_key_range(b"c", b"d", false)],
-            ],
-            vec![
-                vec![build_key_range(b"a", b"b", false)],
-                vec![],
-                vec![
-                    build_key_range(b"e", b"f", false),
-                    build_key_range(b"g", b"h", false),
-                    build_key_range(b"i", b"j", false),
-                ],
-                vec![build_key_range(b"c", b"d", false)],
-            ],
-            vec![
-                vec![build_key_range(b"a", b"b", false)],
-                vec![
-                    build_key_range(b"e", b"f", false),
-                    build_key_range(b"g", b"h", false),
-                    build_key_range(b"i", b"j", false),
+                    build_key_range_info(b"e", b"f", false, vec![]),
+                    build_key_range_info(b"g", b"h", false, vec![]),
+                    build_key_range_info(b"i", b"j", false, vec![]),
                 ],
                 vec![],
-                vec![build_key_range(b"c", b"d", false)],
+                vec![build_key_range_info(b"a", b"b", false, vec![])],
+                vec![build_key_range_info(b"c", b"d", false, vec![])],
             ],
             vec![
-                vec![build_key_range(b"c", b"d", false)],
-                vec![build_key_range(b"a", b"b", false)],
+                vec![build_key_range_info(b"a", b"b", false, vec![])],
                 vec![],
                 vec![
-                    build_key_range(b"e", b"f", false),
-                    build_key_range(b"g", b"h", false),
-                    build_key_range(b"i", b"j", false),
+                    build_key_range_info(b"e", b"f", false, vec![]),
+                    build_key_range_info(b"g", b"h", false, vec![]),
+                    build_key_range_info(b"i", b"j", false, vec![]),
+                ],
+                vec![build_key_range_info(b"c", b"d", false, vec![])],
+            ],
+            vec![
+                vec![build_key_range_info(b"a", b"b", false, vec![])],
+                vec![
+                    build_key_range_info(b"e", b"f", false, vec![]),
+                    build_key_range_info(b"g", b"h", false, vec![]),
+                    build_key_range_info(b"i", b"j", false, vec![]),
+                ],
+                vec![],
+                vec![build_key_range_info(b"c", b"d", false, vec![])],
+            ],
+            vec![
+                vec![build_key_range_info(b"c", b"d", false, vec![])],
+                vec![build_key_range_info(b"a", b"b", false, vec![])],
+                vec![],
+                vec![
+                    build_key_range_info(b"e", b"f", false, vec![]),
+                    build_key_range_info(b"g", b"h", false, vec![]),
+                    build_key_range_info(b"i", b"j", false, vec![]),
                 ],
             ],
             vec![
-                vec![build_key_range(b"c", b"d", false)],
-                vec![build_key_range(b"a", b"b", false)],
+                vec![build_key_range_info(b"c", b"d", false, vec![])],
+                vec![build_key_range_info(b"a", b"b", false, vec![])],
                 vec![
-                    build_key_range(b"e", b"f", false),
-                    build_key_range(b"g", b"h", false),
-                    build_key_range(b"i", b"j", false),
+                    build_key_range_info(b"e", b"f", false, vec![]),
+                    build_key_range_info(b"g", b"h", false, vec![]),
+                    build_key_range_info(b"i", b"j", false, vec![]),
                 ],
                 vec![],
             ],
@@ -1196,36 +1291,36 @@ mod tests {
             vec![
                 vec![],
                 vec![
-                    build_key_range(b"e", b"f", false),
-                    build_key_range(b"g", b"h", false),
+                    build_key_range_info(b"e", b"f", false, vec![]),
+                    build_key_range_info(b"g", b"h", false, vec![]),
                 ],
                 vec![],
                 vec![
-                    build_key_range(b"e", b"f", false),
-                    build_key_range(b"i", b"j", false),
+                    build_key_range_info(b"e", b"f", false, vec![]),
+                    build_key_range_info(b"i", b"j", false, vec![]),
                 ],
                 vec![],
                 vec![
-                    build_key_range(b"g", b"h", false),
-                    build_key_range(b"i", b"j", false),
+                    build_key_range_info(b"g", b"h", false, vec![]),
+                    build_key_range_info(b"i", b"j", false, vec![]),
                 ],
                 vec![],
             ],
             vec![
                 vec![
-                    build_key_range(b"e", b"f", false),
-                    build_key_range(b"g", b"h", false),
+                    build_key_range_info(b"e", b"f", false, vec![]),
+                    build_key_range_info(b"g", b"h", false, vec![]),
                 ],
                 vec![],
                 vec![
-                    build_key_range(b"e", b"f", false),
-                    build_key_range(b"g", b"h", false),
-                    build_key_range(b"i", b"j", false),
+                    build_key_range_info(b"e", b"f", false, vec![]),
+                    build_key_range_info(b"g", b"h", false, vec![]),
+                    build_key_range_info(b"i", b"j", false, vec![]),
                 ],
                 vec![],
                 vec![
-                    build_key_range(b"e", b"f", false),
-                    build_key_range(b"g", b"h", false),
+                    build_key_range_info(b"e", b"f", false, vec![]),
+                    build_key_range_info(b"g", b"h", false, vec![]),
                 ],
             ],
             // Case 4: all empty.
@@ -1233,15 +1328,15 @@ mod tests {
             // Case 5: multiple one-length gaps.
             vec![
                 vec![
-                    build_key_range(b"e", b"f", false),
-                    build_key_range(b"g", b"h", false),
-                    build_key_range(b"e", b"f", false),
-                    build_key_range(b"g", b"h", false),
-                    build_key_range(b"e", b"f", false),
+                    build_key_range_info(b"e", b"f", false, vec![]),
+                    build_key_range_info(b"g", b"h", false, vec![]),
+                    build_key_range_info(b"e", b"f", false, vec![]),
+                    build_key_range_info(b"g", b"h", false, vec![]),
+                    build_key_range_info(b"e", b"f", false, vec![]),
                 ],
-                vec![build_key_range(b"e", b"f", false)],
+                vec![build_key_range_info(b"e", b"f", false, vec![])],
                 vec![],
-                vec![build_key_range(b"e", b"f", false)],
+                vec![build_key_range_info(b"e", b"f", false, vec![])],
                 vec![],
             ],
         ];
@@ -1255,14 +1350,14 @@ mod tests {
         let mut rng = rand::thread_rng();
         let mut test_case = vec![vec![]; DEFAULT_SAMPLE_NUM / 2];
         for _ in 0..100 {
-            for key_ranges in test_case.iter_mut() {
-                key_ranges.clear();
+            for key_range_infos in test_case.iter_mut() {
+                key_range_infos.clear();
                 // Make the empty range more likely to appear.
                 if rng.gen_range(0..=1) == 0 {
                     continue;
                 }
                 for _ in 0..rng.gen_range(1..=5) as usize {
-                    key_ranges.push(build_key_range(b"a", b"b", false));
+                    key_range_infos.push(build_key_range_info(b"a", b"b", false, vec![]));
                 }
             }
             check_sample_length(test_case.clone());
@@ -1271,25 +1366,25 @@ mod tests {
 
     #[test]
     fn test_samples_from_key_ranges() {
-        let key_ranges = vec![];
-        assert_eq!(Samples::from(key_ranges).0.len(), 0);
+        let key_range_infos = vec![];
+        assert_eq!(Samples::from(key_range_infos).0.len(), 0);
 
-        let key_ranges = vec![build_key_range(b"a", b"b", false)];
-        assert_eq!(Samples::from(key_ranges).0.len(), 2);
+        let key_range_infos = vec![build_key_range_info(b"a", b"b", false, vec![])];
+        assert_eq!(Samples::from(key_range_infos).0.len(), 2);
 
-        let key_ranges = vec![
-            build_key_range(b"a", b"a", false),
-            build_key_range(b"b", b"c", false),
+        let key_range_infos = vec![
+            build_key_range_info(b"a", b"a", false, vec![]),
+            build_key_range_info(b"b", b"c", false, vec![]),
         ];
-        assert_eq!(Samples::from(key_ranges).0.len(), 3);
+        assert_eq!(Samples::from(key_range_infos).0.len(), 3);
     }
 
-    fn build_key_ranges(start_key: &[u8], end_key: &[u8], num: usize) -> Vec<KeyRange> {
-        let mut key_ranges = vec![];
+    fn build_key_ranges(start_key: &[u8], end_key: &[u8], num: usize) -> Vec<KeyRangeInfo> {
+        let mut key_range_infos = vec![];
         for _ in 0..num {
-            key_ranges.push(build_key_range(start_key, end_key, false));
+            key_range_infos.push(build_key_range_info(start_key, end_key, false, vec![]));
         }
-        key_ranges
+        key_range_infos
     }
 
     #[test]
@@ -1300,7 +1395,11 @@ mod tests {
         r.add_query_num_batch(region_id, &Peer::default(), key_ranges, QueryKind::Get);
         let key_ranges = build_key_ranges(b"b", b"b", r.sample_num * 1000);
         r.add_query_num_batch(region_id, &Peer::default(), key_ranges, QueryKind::Get);
-        let samples = &r.region_read_infos.get(&region_id).unwrap().key_ranges;
+        let samples = &r
+            .region_read_infos
+            .get(&region_id)
+            .unwrap()
+            .get_key_ranges();
         let num = samples
             .iter()
             .filter(|key_range| key_range.start_key == b"b")
@@ -1318,7 +1417,7 @@ mod tests {
                 qps_stats.add_query_num(
                     i,
                     &Peer::default(),
-                    build_key_range(b"a", b"b", false),
+                    build_key_range_info(b"a", b"b", false, vec![]),
                     QueryKind::Get,
                 )
             }
@@ -1329,9 +1428,9 @@ mod tests {
     #[bench]
     fn samples_evaluate(b: &mut test::Bencher) {
         let mut samples = Samples(vec![Sample::new(b"c")]);
-        let key_range = build_key_range(b"a", b"b", false);
+        let key_range = build_key_range_info(b"a", b"b", false, vec![]);
         b.iter(|| {
-            samples.evaluate(&key_range);
+            samples.evaluate(&key_range, false);
         });
     }
 
@@ -1365,7 +1464,7 @@ mod tests {
                 qps_stats.add_query_num(
                     1,
                     &Peer::default(),
-                    build_key_range(&start_key, &key, false),
+                    build_key_range_info(&start_key, &key, false, vec![]),
                     QueryKind::Scan,
                 );
             }
@@ -1379,7 +1478,7 @@ mod tests {
             qps_stats.add_query_num(
                 1,
                 &Peer::default(),
-                build_key_range(b"a", b"b", false),
+                build_key_range_info(b"a", b"b", false, vec![]),
                 QueryKind::Get,
             );
         });
