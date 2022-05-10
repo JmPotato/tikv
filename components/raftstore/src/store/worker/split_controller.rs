@@ -1,9 +1,7 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::cmp::{min, Ordering};
-use std::collections::BinaryHeap;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::slice::{Iter, IterMut};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -214,14 +212,19 @@ impl Sample {
 
 struct Samples(Vec<Sample>);
 
-impl From<Vec<KeyRangeInfo>> for Samples {
-    fn from(key_ranges: Vec<KeyRangeInfo>) -> Self {
+impl Samples {
+    fn from(key_ranges: Vec<KeyRangeInfo>, with_scanned_keys: bool) -> Self {
         Samples(
             key_ranges
                 .iter()
-                .fold(HashSet::new(), |mut hash_set, key_range| {
-                    hash_set.insert(&key_range.start_key);
-                    hash_set.insert(&key_range.end_key);
+                .fold(HashSet::new(), |mut hash_set, key_range_info| {
+                    hash_set.insert(&key_range_info.start_key);
+                    hash_set.insert(&key_range_info.end_key);
+                    if with_scanned_keys {
+                        key_range_info.scanned_keys.iter().for_each(|scanned_key| {
+                            hash_set.insert(scanned_key);
+                        });
+                    }
                     hash_set
                 })
                 .into_iter()
@@ -334,7 +337,7 @@ pub struct Recorder {
     pub detect_times: u64,
     pub detected_times: u64,
     pub peer: Peer,
-    pub key_ranges: Vec<Vec<KeyRangeInfo>>,
+    pub key_range_infos: Vec<Vec<KeyRangeInfo>>,
     pub create_time: SystemTime,
     pub cpu_usage: f64,
 }
@@ -345,7 +348,7 @@ impl Recorder {
             detect_times,
             detected_times: 0,
             peer: Peer::default(),
-            key_ranges: vec![],
+            key_range_infos: vec![],
             create_time: SystemTime::now(),
             cpu_usage: 0.0,
         }
@@ -353,7 +356,7 @@ impl Recorder {
 
     fn record(&mut self, key_ranges: Vec<KeyRangeInfo>) {
         self.detected_times += 1;
-        self.key_ranges.push(key_ranges);
+        self.key_range_infos.push(key_ranges);
     }
 
     fn update_peer(&mut self, peer: &Peer) {
@@ -374,9 +377,10 @@ impl Recorder {
     // This will start a second-level sampling on the previous sampled key ranges,
     // evaluate the samples according to the given key range, and compute the split keys finally.
     fn collect(&self, config: &SplitConfig, with_scanned_keys: bool) -> Vec<u8> {
-        let sampled_key_ranges = sample(config.sample_num, self.key_ranges.clone(), |x| x);
-        let mut samples = Samples::from(sampled_key_ranges);
-        let recorded_key_ranges: Vec<&KeyRangeInfo> = self.key_ranges.iter().flatten().collect();
+        let sampled_key_ranges = sample(config.sample_num, self.key_range_infos.clone(), |x| x);
+        let mut samples = Samples::from(sampled_key_ranges, with_scanned_keys);
+        let recorded_key_ranges: Vec<&KeyRangeInfo> =
+            self.key_range_infos.iter().flatten().collect();
         // Because we need to observe the number of `no_enough_key` of all the actual keys,
         // so we do this check after the samples are calculated.
         if (recorded_key_ranges.len() as u64) < config.sample_threshold {
@@ -712,16 +716,17 @@ impl AutoSplitController {
         cpu_info_vec: Vec<Arc<RawRecords>>,
         thread_stats: &ThreadInfoStatistics,
     ) -> (Vec<usize>, Vec<SplitInfo>) {
-        let mut split_infos = vec![];
-        let mut hot_regions = vec![];
-        let mut top = BinaryHeap::with_capacity(TOP_N as usize);
-
+        let mut top_cpu_usage = vec![];
+        let mut top_qps = BinaryHeap::with_capacity(TOP_N);
+        // Prepare some diagnostic info.
         let regions_info = Self::collect_regions_info(read_stats_vec, cpu_info_vec);
         let (grpc_thread_usage, grpc_thread_count) =
             Self::collect_thread_usage_and_count(thread_stats, "grpc-server");
         let grpc_thread_cpu_threshold = grpc_thread_count as f64 * 0.5;
         let (unified_read_pool_thread_usage, _) =
             Self::collect_thread_usage_and_count(thread_stats, "unified-read-po");
+        // Hard-coded, because the thread name is not correct for now.
+        // TODO: fix this.
         let unified_read_pool_thread_count: usize = 5;
         let unified_read_pool_cpu_threshold = unified_read_pool_thread_count as f64 * 0.8;
         debug!("flush to load base split";
@@ -732,7 +737,8 @@ impl AutoSplitController {
             "unified_read_pool_thread_count" => unified_read_pool_thread_count,
             "unified_read_pool_cpu_threshold" => unified_read_pool_cpu_threshold,
         );
-
+        // Start to record the read stats info.
+        let mut split_infos = vec![];
         for (region_id, read_info_vec) in regions_info.read_info_map.clone() {
             let qps_prefix_sum = prefix_sum(read_info_vec.iter(), RegionReadInfo::get_read_qps);
             // region_infos is not empty, so it's safe to unwrap here.
@@ -811,7 +817,7 @@ impl AutoSplitController {
                     LOAD_BASE_SPLIT_EVENT
                         .with_label_values(&["cpu_hot_region"])
                         .inc();
-                    hot_regions.push(region_id);
+                    top_cpu_usage.push(region_id);
                 }
             } else {
                 LOAD_BASE_SPLIT_EVENT
@@ -819,18 +825,17 @@ impl AutoSplitController {
                     .inc();
             }
 
-            top.push(qps);
+            top_qps.push(qps);
         }
 
-        if !hot_regions.is_empty() && grpc_thread_usage < grpc_thread_cpu_threshold {
-            if hot_regions.len() > 1 {
-                hot_regions.sort_by(|a, b| {
-                    let cpu_usage_a = self.recorders.get(a).unwrap().cpu_usage;
-                    let cpu_usage_b = self.recorders.get(b).unwrap().cpu_usage;
-                    cpu_usage_b.partial_cmp(&cpu_usage_a).unwrap()
-                });
-            }
-            let region_id = hot_regions[0];
+        // Check if the top CPU usage region could be split.
+        if !top_cpu_usage.is_empty() && grpc_thread_usage < grpc_thread_cpu_threshold {
+            top_cpu_usage.sort_by(|a, b| {
+                let cpu_usage_a = self.recorders.get(a).unwrap().cpu_usage;
+                let cpu_usage_b = self.recorders.get(b).unwrap().cpu_usage;
+                cpu_usage_b.partial_cmp(&cpu_usage_a).unwrap()
+            });
+            let region_id = top_cpu_usage[0];
             let recorder = self.recorders.get_mut(&region_id).unwrap();
             let key = recorder.collect(&self.cfg, true);
             if !key.is_empty() {
@@ -846,14 +851,18 @@ impl AutoSplitController {
                     "region_id" => region_id,
                     "cpu_usage" => recorder.cpu_usage,
                 );
+            } else {
+                LOAD_BASE_SPLIT_EVENT
+                    .with_label_values(&["unable_to_split_hot"])
+                    .inc();
             }
         }
-
-        for region_id in hot_regions {
+        // Clean up the recorders.
+        for region_id in top_cpu_usage {
             self.recorders.remove(&region_id);
         }
 
-        (top.into_vec(), split_infos)
+        (top_qps.into_vec(), split_infos)
     }
 
     pub fn clear(&mut self) {
@@ -1369,16 +1378,16 @@ mod tests {
     #[test]
     fn test_samples_from_key_ranges() {
         let key_range_infos = vec![];
-        assert_eq!(Samples::from(key_range_infos).0.len(), 0);
+        assert_eq!(Samples::from(key_range_infos, false).0.len(), 0);
 
         let key_range_infos = vec![build_key_range_info(b"a", b"b", false, vec![])];
-        assert_eq!(Samples::from(key_range_infos).0.len(), 2);
+        assert_eq!(Samples::from(key_range_infos, false).0.len(), 2);
 
         let key_range_infos = vec![
             build_key_range_info(b"a", b"a", false, vec![]),
             build_key_range_info(b"b", b"c", false, vec![]),
         ];
-        assert_eq!(Samples::from(key_range_infos).0.len(), 3);
+        assert_eq!(Samples::from(key_range_infos, false).0.len(), 3);
     }
 
     fn build_key_ranges(start_key: &[u8], end_key: &[u8], num: usize) -> Vec<KeyRangeInfo> {
