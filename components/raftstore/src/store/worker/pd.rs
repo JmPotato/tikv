@@ -1445,6 +1445,8 @@ where
                         }
                     } else {
                         CasualMessage::HalfSplitRegion {
+                            start_key: None,
+                            end_key: None,
                             region_epoch: epoch,
                             policy: split_region.get_policy(),
                             source: "pd",
@@ -1774,9 +1776,14 @@ where
                         if let Ok(Some(region)) =
                             pd_client.get_region_by_id(split_info.region_id).await
                         {
-                            if split_info.split_key.is_empty() {
+                            if split_info.split_key.is_empty()
+                                && split_info.start_key.is_some()
+                                && split_info.end_key.is_some()
+                            {
                                 let region_id = region.get_id();
                                 let msg = CasualMessage::HalfSplitRegion {
+                                    start_key: split_info.start_key,
+                                    end_key: split_info.end_key,
                                     region_epoch: region.get_region_epoch().clone(),
                                     policy: pdpb::CheckPolicy::Scan,
                                     source: "load_base_split",

@@ -20,6 +20,7 @@ use tikv_util::metrics::ThreadInfoStatistics;
 use tikv_util::{debug, info, warn};
 
 use crate::store::metrics::*;
+use crate::store::util::build_key_range;
 use crate::store::worker::query_stats::{is_read_query, QueryStats};
 use crate::store::worker::split_config::get_sample_num;
 use crate::store::worker::{FlowStatistics, SplitConfig, SplitConfigManager};
@@ -276,7 +277,8 @@ pub struct Recorder {
     pub peer: Peer,
     pub key_ranges: Vec<Vec<KeyRange>>,
     pub create_time: SystemTime,
-    pub cpu_usages: f64,
+    pub cpu_usage: f64,
+    pub hottest_key_range: Option<KeyRange>,
 }
 
 impl Recorder {
@@ -287,7 +289,8 @@ impl Recorder {
             peer: Peer::default(),
             key_ranges: vec![],
             create_time: SystemTime::now(),
-            cpu_usages: 0.0,
+            cpu_usage: 0.0,
+            hottest_key_range: None,
         }
     }
 
@@ -302,8 +305,12 @@ impl Recorder {
         }
     }
 
-    fn add_cpu_usage(&mut self, cpu_usages: f64) {
-        self.cpu_usages += cpu_usages;
+    fn update_cpu_usage(&mut self, cpu_usage: f64) {
+        self.cpu_usage = cpu_usage;
+    }
+
+    fn update_hottest_key_range(&mut self, key_range: KeyRange) {
+        self.hottest_key_range = Some(key_range);
     }
 
     fn is_ready(&self) -> bool {
@@ -524,6 +531,7 @@ impl WriteStats {
 struct RegionsInfo {
     read_info_map: HashMap<u64, Vec<RegionReadInfo>>,
     cpu_info_map: HashMap<u64, f64>,
+    hottest_key_range_map: HashMap<u64, KeyRange>,
 }
 
 impl RegionsInfo {
@@ -540,8 +548,20 @@ impl RegionsInfo {
         *cpu_info = cpu_usage;
     }
 
+    fn update_region_hottest_key_range(&mut self, region_id: u64, key_range: KeyRange) {
+        let hottest_key_range = self
+            .hottest_key_range_map
+            .entry(region_id)
+            .or_insert_with(|| key_range.clone());
+        *hottest_key_range = key_range;
+    }
+
     fn get_region_cpu_usage(&self, region_id: &u64) -> f64 {
         *self.cpu_info_map.get(region_id).unwrap_or(&0.0)
+    }
+
+    fn get_region_hottest_key_range(&self, region_id: &u64) -> Option<&KeyRange> {
+        self.hottest_key_range_map.get(region_id)
     }
 }
 
@@ -550,6 +570,8 @@ pub struct SplitInfo {
     pub region_id: u64,
     pub split_key: Vec<u8>,
     pub peer: Peer,
+    pub start_key: Option<Vec<u8>>,
+    pub end_key: Option<Vec<u8>>,
 }
 
 pub struct AutoSplitController {
@@ -590,10 +612,19 @@ impl AutoSplitController {
         // Calculate the Region CPU usage.
         let mut collect_interval_ms = 0;
         let mut region_cpu_times = HashMap::new();
+        let mut region_key_range_cpu_times = HashMap::new();
         cpu_info_vec.iter().for_each(|cpu_info| {
             cpu_info.records.iter().for_each(|(tag, record)| {
+                // Calculate the Region ID -> CPU Time.
                 let region_cpu_time = region_cpu_times.entry(tag.region_id).or_insert_with(|| 0);
                 *region_cpu_time += record.cpu_time;
+                // Calculate the (Region ID, Key Range) -> CPU Time.
+                tag.key_ranges.iter().for_each(|key_range| {
+                    let region_key_range_cpu_time = region_key_range_cpu_times
+                        .entry((tag.region_id, key_range))
+                        .or_insert_with(|| 0);
+                    *region_key_range_cpu_time += record.cpu_time;
+                })
             });
             collect_interval_ms += cpu_info.duration.as_millis();
         });
@@ -601,6 +632,21 @@ impl AutoSplitController {
             regions_info
                 .update_region_cpu_info(*region_id, *cpu_time as f64 / collect_interval_ms as f64);
         });
+        let mut last_hottest_key_range_cpu_times = HashMap::with_capacity(region_cpu_times.len());
+        region_key_range_cpu_times
+            .iter()
+            .for_each(|((region_id, key_range), cpu_time)| {
+                let last_hottest_key_range_cpu_time = last_hottest_key_range_cpu_times
+                    .entry(*region_id)
+                    .or_insert_with(|| 0);
+                if cpu_time > last_hottest_key_range_cpu_time {
+                    regions_info.update_region_hottest_key_range(
+                        *region_id,
+                        build_key_range(&key_range.0, &key_range.1, false),
+                    );
+                    *last_hottest_key_range_cpu_time = *cpu_time;
+                }
+            });
         regions_info
     }
 
@@ -629,27 +675,32 @@ impl AutoSplitController {
         cpu_info_vec: Vec<Arc<RawRecords>>,
         thread_stats: &ThreadInfoStatistics,
     ) -> (Vec<usize>, Vec<SplitInfo>) {
-        let mut split_infos = vec![];
-        let mut hot_regions = vec![];
-        let mut top = BinaryHeap::with_capacity(TOP_N as usize);
-
+        let mut top_cpu_usage = vec![];
+        let mut top_qps = BinaryHeap::with_capacity(TOP_N);
+        // Prepare some diagnostic info.
         let regions_info = Self::collect_regions_info(read_stats_vec, cpu_info_vec);
         let (grpc_thread_usage, grpc_thread_count) =
             Self::collect_thread_usage_and_count(thread_stats, "grpc-server");
+        // TODO: make the factor configurable.
         let grpc_thread_cpu_threshold = grpc_thread_count as f64 * 0.5;
         let (unified_read_pool_thread_usage, _) =
             Self::collect_thread_usage_and_count(thread_stats, "unified-read-po");
+        // TODO: fix this hard-coded thread count caused by the incorrect thread name.
         let unified_read_pool_thread_count: usize = 5;
         let unified_read_pool_cpu_threshold = unified_read_pool_thread_count as f64 * 0.8;
-        info!("flush to load base split";
+        let region_cpu_usage_threshold = unified_read_pool_cpu_threshold * 0.8;
+        debug!("flush to load base split";
             "grpc_thread_usage" => grpc_thread_usage,
             "grpc_thread_count" => grpc_thread_count,
             "grpc_thread_cpu_threshold" => grpc_thread_cpu_threshold,
             "unified_read_pool_thread_usage" => unified_read_pool_thread_usage,
             "unified_read_pool_thread_count" => unified_read_pool_thread_count,
             "unified_read_pool_cpu_threshold" => unified_read_pool_cpu_threshold,
+            "region_cpu_usage_threshold" => region_cpu_usage_threshold,
         );
 
+        // Start to record the read stats info.
+        let mut split_infos = vec![];
         for (region_id, read_info_vec) in regions_info.read_info_map.clone() {
             let qps_prefix_sum = prefix_sum(read_info_vec.iter(), RegionReadInfo::get_read_qps);
             // region_infos is not empty, so it's safe to unwrap here.
@@ -677,8 +728,7 @@ impl AutoSplitController {
             if qps < self.cfg.qps_threshold
                 && byte < self.cfg.byte_threshold
                 && (unified_read_pool_thread_usage < unified_read_pool_cpu_threshold
-                    || region_cpu_usage < unified_read_pool_cpu_threshold * 0.5)
-            // TODO: make the factor configurable.
+                    || region_cpu_usage < region_cpu_usage_threshold)
             {
                 self.recorders.remove_entry(&region_id);
                 continue;
@@ -692,7 +742,10 @@ impl AutoSplitController {
                 .entry(region_id)
                 .or_insert_with(|| Recorder::new(detect_times));
             recorder.update_peer(&read_info_vec[0].peer);
-            recorder.add_cpu_usage(region_cpu_usage);
+            recorder.update_cpu_usage(region_cpu_usage);
+            if let Some(key_range) = regions_info.get_region_hottest_key_range(&region_id) {
+                recorder.update_hottest_key_range(key_range.clone());
+            }
 
             let key_ranges = sample(
                 self.cfg.sample_num,
@@ -713,6 +766,8 @@ impl AutoSplitController {
                         region_id,
                         split_key: key,
                         peer: recorder.peer.clone(),
+                        start_key: None,
+                        end_key: None,
                     });
                     LOAD_BASE_SPLIT_EVENT
                         .with_label_values(&[READY_TO_SPLIT])
@@ -720,42 +775,71 @@ impl AutoSplitController {
                     info!("load base split region";
                         "region_id" => region_id,
                         "qps" => qps,
+                        "byte" => byte,
+                        "cpu_usage" => region_cpu_usage,
                     );
-                } else {
+                    self.recorders.remove(&region_id);
+                } else if unified_read_pool_thread_usage >= unified_read_pool_cpu_threshold
+                    && region_cpu_usage >= region_cpu_usage_threshold
+                {
                     LOAD_BASE_SPLIT_EVENT
                         .with_label_values(&["cpu_hot_region"])
                         .inc();
-                    hot_regions.push((region_id, recorder.cpu_usages, recorder.peer.clone()));
+                    top_cpu_usage.push(region_id);
                 }
-                self.recorders.remove(&region_id);
             } else {
                 LOAD_BASE_SPLIT_EVENT
                     .with_label_values(&[NOT_READY_TO_SPLIT])
                     .inc();
             }
 
-            top.push(qps);
+            top_qps.push(qps);
         }
 
-        // Sort the hot regions by CPU usage.
-        if !hot_regions.is_empty() && grpc_thread_usage < grpc_thread_cpu_threshold {
-            LOAD_BASE_SPLIT_EVENT
-                .with_label_values(&["ready_to_split_hot"])
-                .inc();
-            hot_regions.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            let split_info = SplitInfo {
-                region_id: hot_regions[0].0,
-                split_key: vec![],
-                peer: hot_regions[0].2.clone(),
-            };
-            info!("load base split ready_to_split_hot";
-                "split_info" => ?split_info,
-            );
-            // Split the region on half.
-            split_infos.push(split_info);
+        // Check if the top CPU usage region could be split.
+        if !top_cpu_usage.is_empty() && grpc_thread_usage < grpc_thread_cpu_threshold {
+            // Calculate by using the latest CPU usage.
+            top_cpu_usage.sort_by(|a, b| {
+                let cpu_usage_a = self.recorders.get(a).unwrap().cpu_usage;
+                let cpu_usage_b = self.recorders.get(b).unwrap().cpu_usage;
+                cpu_usage_b.partial_cmp(&cpu_usage_a).unwrap()
+            });
+            let region_id = top_cpu_usage[0];
+            let recorder = self.recorders.get_mut(&region_id).unwrap();
+            if recorder.hottest_key_range.is_some() {
+                split_infos.push(SplitInfo {
+                    region_id,
+                    split_key: vec![],
+                    peer: recorder.peer.clone(),
+                    start_key: Some(
+                        recorder
+                            .hottest_key_range
+                            .as_ref()
+                            .unwrap()
+                            .start_key
+                            .clone(),
+                    ),
+                    end_key: Some(recorder.hottest_key_range.as_ref().unwrap().end_key.clone()),
+                });
+                LOAD_BASE_SPLIT_EVENT
+                    .with_label_values(&["ready_to_split_hot"])
+                    .inc();
+                info!("load base split region";
+                    "region_id" => region_id,
+                    "cpu_usage" => recorder.cpu_usage,
+                );
+            } else {
+                LOAD_BASE_SPLIT_EVENT
+                    .with_label_values(&["unable_to_split_hot"])
+                    .inc();
+            }
+        }
+        // Clean up the recorders.
+        for region_id in top_cpu_usage {
+            self.recorders.remove(&region_id);
         }
 
-        (top.into_vec(), split_infos)
+        (top_qps.into_vec(), split_infos)
     }
 
     pub fn clear(&mut self) {
@@ -779,7 +863,6 @@ mod tests {
     use super::*;
     use txn_types::Key;
 
-    use crate::store::util::build_key_range;
     use crate::store::worker::split_config::DEFAULT_SAMPLE_NUM;
 
     enum Position {

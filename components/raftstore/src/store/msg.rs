@@ -378,6 +378,8 @@ pub enum CasualMessage<EK: KvEngine> {
     },
     /// Half split the target region.
     HalfSplitRegion {
+        start_key: Option<Vec<u8>>,
+        end_key: Option<Vec<u8>>,
         region_epoch: RegionEpoch,
         policy: CheckPolicy,
         source: &'static str,

@@ -139,6 +139,8 @@ pub struct Bucket {
 pub enum Task {
     SplitCheckTask {
         region: Region,
+        start_key: Option<Vec<u8>>,
+        end_key: Option<Vec<u8>>,
         auto_split: bool,
         policy: CheckPolicy,
         bucket_ranges: Option<Vec<BucketRange>>,
@@ -152,12 +154,16 @@ pub enum Task {
 impl Task {
     pub fn split_check(
         region: Region,
+        start_key: Option<Vec<u8>>,
+        end_key: Option<Vec<u8>>,
         auto_split: bool,
         policy: CheckPolicy,
         bucket_ranges: Option<Vec<BucketRange>>,
     ) -> Task {
         Task::SplitCheckTask {
             region,
+            start_key,
+            end_key,
             auto_split,
             policy,
             bucket_ranges,
@@ -250,13 +256,15 @@ where
     fn check_split_and_bucket(
         &mut self,
         region: &Region,
+        start_key: Option<Vec<u8>>,
+        end_key: Option<Vec<u8>>,
         auto_split: bool,
         policy: CheckPolicy,
         bucket_ranges: Option<Vec<BucketRange>>,
     ) {
         let region_id = region.get_id();
-        let start_key = keys::enc_start_key(region);
-        let end_key = keys::enc_end_key(region);
+        let start_key = start_key.unwrap_or_else(|| keys::enc_start_key(region));
+        let end_key = end_key.unwrap_or_else(|| keys::enc_end_key(region));
         debug!(
             "executing task";
             "region_id" => region_id,
@@ -488,10 +496,19 @@ where
         match task {
             Task::SplitCheckTask {
                 region,
+                start_key,
+                end_key,
                 auto_split,
                 policy,
                 bucket_ranges,
-            } => self.check_split_and_bucket(&region, auto_split, policy, bucket_ranges),
+            } => self.check_split_and_bucket(
+                &region,
+                start_key,
+                end_key,
+                auto_split,
+                policy,
+                bucket_ranges,
+            ),
             Task::ChangeConfig(c) => self.change_cfg(c),
             Task::ApproximateBuckets(region) => {
                 if self.coprocessor.cfg.enable_region_bucket {

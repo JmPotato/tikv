@@ -925,12 +925,21 @@ where
                 self.on_compaction_declined_bytes(bytes);
             }
             CasualMessage::HalfSplitRegion {
+                start_key,
+                end_key,
                 region_epoch,
                 policy,
                 source,
                 cb,
             } => {
-                self.on_schedule_half_split_region(&region_epoch, policy, source, cb);
+                self.on_schedule_half_split_region(
+                    start_key,
+                    end_key,
+                    &region_epoch,
+                    policy,
+                    source,
+                    cb,
+                );
             }
             CasualMessage::GcSnap { snaps } => {
                 self.on_gc_snap(snaps);
@@ -4905,6 +4914,8 @@ where
         self.fsm.skip_split_count = 0;
         let task = SplitCheckTask::split_check(
             self.region().clone(),
+            None,
+            None,
             true,
             CheckPolicy::Scan,
             self.gen_bucket_range_for_update(),
@@ -5271,6 +5282,8 @@ where
 
     fn on_schedule_half_split_region(
         &mut self,
+        start_key: Option<Vec<u8>>,
+        end_key: Option<Vec<u8>>,
         region_epoch: &metapb::RegionEpoch,
         policy: CheckPolicy,
         source: &str,
@@ -5314,8 +5327,14 @@ where
                 cb(peer_stat);
             }
         }
-        let task =
-            SplitCheckTask::split_check(region.clone(), false, policy, split_check_bucket_ranges);
+        let task = SplitCheckTask::split_check(
+            region.clone(),
+            start_key,
+            end_key,
+            false,
+            policy,
+            split_check_bucket_ranges,
+        );
         if let Err(e) = self.ctx.split_check_scheduler.schedule(task) {
             error!(
                 "failed to schedule split check";
