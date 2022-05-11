@@ -620,6 +620,12 @@ impl AutoSplitController {
                 *region_cpu_time += record.cpu_time;
                 // Calculate the (Region ID, Key Range) -> CPU Time.
                 tag.key_ranges.iter().for_each(|key_range| {
+                    info!("calculate the key range cpu";
+                        "region_id" => tag.region_id,
+                        "start_key" => log_wrappers::Value::key(&key_range.0),
+                        "end_key" => log_wrappers::Value::key(&key_range.1),
+                        "cpu_usage" => record.cpu_time,
+                    );
                     let region_key_range_cpu_time = region_key_range_cpu_times
                         .entry((tag.region_id, key_range))
                         .or_insert_with(|| 0);
@@ -826,6 +832,8 @@ impl AutoSplitController {
                     .inc();
                 info!("load base split region";
                     "region_id" => region_id,
+                    "start_key" => log_wrappers::Value::key(&recorder.hottest_key_range.as_ref().unwrap().start_key),
+                    "end_key" => log_wrappers::Value::key(&recorder.hottest_key_range.as_ref().unwrap().end_key),
                     "cpu_usage" => recorder.cpu_usage,
                 );
             } else {

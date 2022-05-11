@@ -265,8 +265,8 @@ where
         let region_id = region.get_id();
         let start_key = start_key.unwrap_or_else(|| keys::enc_start_key(region));
         let end_key = end_key.unwrap_or_else(|| keys::enc_end_key(region));
-        debug!(
-            "executing task";
+        info!(
+            "executing check_split_and_bucket task";
             "region_id" => region_id,
             "start_key" => log_wrappers::Value::key(&start_key),
             "end_key" => log_wrappers::Value::key(&end_key),

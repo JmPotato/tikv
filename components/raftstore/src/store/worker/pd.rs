@@ -1454,7 +1454,7 @@ where
                         }
                     };
                     if let Err(e) = router.send(region_id, PeerMsg::CasualMessage(msg)) {
-                        error!("send halfsplit request failed"; "region_id" => region_id, "err" => ?e);
+                        error!("send half split request failed"; "region_id" => region_id, "err" => ?e);
                     }
                 } else if resp.has_merge() {
                     PD_HEARTBEAT_COUNTER_VEC.with_label_values(&["merge"]).inc();
