@@ -328,6 +328,12 @@ impl<T: RaftStoreRouter<E::Local> + 'static, E: Engine, L: LockManager, F: KvFor
         MvccGetByStartTsRequest,
         MvccGetByStartTsResponse
     );
+    handle_request!(
+        kv_flashback_to_version,
+        future_flashback_to_version,
+        FlashbackToVersionRequest,
+        FlashbackToVersionResponse
+    );
     handle_request!(raw_get, future_raw_get, RawGetRequest, RawGetResponse);
     handle_request!(
         raw_batch_get,
@@ -1353,6 +1359,7 @@ fn handle_batch_commands_request<E: Engine, L: LockManager, F: KvFormat>(
         ResolveLock, future_resolve_lock(storage), kv_resolve_lock;
         Gc, future_gc(), kv_gc;
         DeleteRange, future_delete_range(storage), kv_delete_range;
+        FlashbackToVersion, future_flashback_to_version(storage), kv_flashback_to_version;
         RawBatchGet, future_raw_batch_get(storage), raw_batch_get;
         RawPut, future_raw_put(storage), raw_put;
         RawBatchPut, future_raw_batch_put(storage), raw_batch_put;
@@ -2194,6 +2201,12 @@ txn_command_future!(future_mvcc_get_by_start_ts, MvccGetByStartTsRequest, MvccGe
         Ok(None) => {
             resp.set_info(Default::default());
         }
+        Err(e) => resp.set_error(format!("{}", e)),
+    }
+});
+txn_command_future!(future_flashback_to_version, FlashbackToVersionRequest, FlashbackToVersionResponse, (v, resp) {
+    match v {
+        Ok(()) => {},
         Err(e) => resp.set_error(format!("{}", e)),
     }
 });
