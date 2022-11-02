@@ -60,14 +60,14 @@ impl<S: Snapshot> ReadCommand<S> for FlashbackToVersionReadPhase {
         }
         let mut reader = MvccReader::new_with_ctx(snapshot, Some(ScanMode::Forward), &self.ctx);
         // Scan the locks.
-        let (mut key_locks, has_remain_locks) = flashback_to_version_read_lock(
+        let (key_locks, has_remain_locks) = flashback_to_version_read_lock(
             &mut reader,
             &self.next_lock_key,
             &self.end_key,
             statistics,
         )?;
         // Scan the writes.
-        let (mut key_old_writes, has_remain_writes) = flashback_to_version_read_write(
+        let (key_old_writes, has_remain_writes) = flashback_to_version_read_write(
             &mut reader,
             key_locks.len(),
             &self.next_write_key,
@@ -83,12 +83,12 @@ impl<S: Snapshot> ReadCommand<S> for FlashbackToVersionReadPhase {
         );
         // Check next key firstly.
         let next_lock_key = if has_remain_locks {
-            key_locks.pop().map(|(key, _)| key)
+            key_locks.last().map(|(key, _)| key.clone())
         } else {
             None
         };
         let next_write_key = match (has_remain_writes, key_old_writes.is_empty()) {
-            (true, false) => key_old_writes.pop().map(|(key, _)| key),
+            (true, false) => key_old_writes.last().map(|(key, _)| key.clone()),
             // We haven't read any write yet, so we need to read the writes in the next
             // batch later.
             (true, true) => self.next_write_key,
