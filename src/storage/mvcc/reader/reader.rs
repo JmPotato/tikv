@@ -582,6 +582,11 @@ impl<S: EngineSnapshot> MvccReader<S> {
             }
             let commit_ts = key.decode_ts()?;
             let user_key = key.clone().truncate_ts()?;
+            info!(
+                "new user key";
+                "user_key" => log_wrappers::Value::key(user_key.as_encoded().as_slice()),
+                "commit_ts" => commit_ts
+            );
             // To make sure we only check each unique key once and `filter(&key)` returns
             // true.
             if (cur_key.is_some() && cur_key.clone().unwrap() == user_key) || !filter(&key) {
@@ -623,6 +628,12 @@ impl<S: EngineSnapshot> MvccReader<S> {
                     }
                 }
             }
+            info!(
+                "push user key into key_writes";
+                "user_key" => log_wrappers::Value::key(user_key.as_encoded().as_slice()),
+                "commit_ts" => commit_ts,
+                "write" => ?write
+            );
             key_writes.push((user_key, commit_ts, write));
             if limit > 0 && key_writes.len() == limit {
                 has_remain = true;

@@ -21,6 +21,7 @@ command! {
         cmd_ty => (),
         display => "kv::command::flashback_to_version_read_phase -> {} | {} {} | {:?}", (version, start_ts, commit_ts, ctx),
         content => {
+            region_id: u64,
             start_ts: TimeStamp,
             commit_ts: TimeStamp,
             version: TimeStamp,
@@ -52,6 +53,15 @@ impl CommandExt for FlashbackToVersionReadPhase {
 ///       phase.
 impl<S: Snapshot> ReadCommand<S> for FlashbackToVersionReadPhase {
     fn process_read(self, snapshot: S, statistics: &mut Statistics) -> Result<ProcessResult> {
+        info!("FlashbackToVersionReadPhase::process_read";
+            "region_id" => self.region_id,
+            "start_ts" => ?self.start_ts,
+            "commit_ts" => ?self.commit_ts,
+            "version" => ?self.version,
+            "end_key" => log_wrappers::Value::key(self.end_key.as_ref().unwrap_or(&Key::from_raw(b"")).as_encoded().as_slice()),
+            "next_lock_key" => log_wrappers::Value::key(self.next_lock_key.as_ref().unwrap_or(&Key::from_raw(b"")).as_encoded().as_slice()),
+            "next_write_key" => log_wrappers::Value::key(self.next_write_key.as_ref().unwrap_or(&Key::from_raw(b"")).as_encoded().as_slice()),
+        );
         if self.commit_ts <= self.start_ts {
             return Err(Error::from(ErrorInner::InvalidTxnTso {
                 start_ts: self.start_ts,
@@ -76,6 +86,7 @@ impl<S: Snapshot> ReadCommand<S> for FlashbackToVersionReadPhase {
             self.start_ts,
             self.commit_ts,
             statistics,
+            self.region_id,
         )?;
         tls_collect_keyread_histogram_vec(
             self.tag().get_str(),
@@ -94,11 +105,18 @@ impl<S: Snapshot> ReadCommand<S> for FlashbackToVersionReadPhase {
             (true, true) => self.next_write_key,
             (..) => None,
         };
+        info!(
+            "FlashbackToVersionReadPhase::process_read next";
+            "region_id" => self.region_id,
+            "next_lock_key" => log_wrappers::Value::key(next_lock_key.as_ref().unwrap_or(&Key::from_raw(b"")).as_encoded().as_slice()),
+            "next_write_key" => log_wrappers::Value::key(next_write_key.as_ref().unwrap_or(&Key::from_raw(b"")).as_encoded().as_slice()),
+        );
         if key_locks.is_empty() && key_old_writes.is_empty() {
             if next_write_key.is_some() || next_lock_key.is_some() {
                 // Although there is no key left in this batch, keep processing the next batch
                 // since next key(write or lock) exist.
                 let next_cmd = FlashbackToVersionReadPhase {
+                    region_id: self.region_id,
                     ctx: self.ctx,
                     deadline: self.deadline,
                     start_ts: self.start_ts,
@@ -115,6 +133,7 @@ impl<S: Snapshot> ReadCommand<S> for FlashbackToVersionReadPhase {
             Ok(ProcessResult::Res)
         } else {
             let next_cmd = FlashbackToVersion {
+                region_id: self.region_id,
                 ctx: self.ctx,
                 deadline: self.deadline,
                 start_ts: self.start_ts,

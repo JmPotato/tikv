@@ -353,14 +353,16 @@ impl From<MvccGetByStartTsRequest> for TypedCommand<Option<(Key, MvccInfo)>> {
 
 impl From<FlashbackToVersionRequest> for TypedCommand<()> {
     fn from(mut req: FlashbackToVersionRequest) -> Self {
+        let ctx = req.take_context();
         FlashbackToVersionReadPhase::new(
+            ctx.get_region_id(),
             req.get_start_ts().into(),
             req.get_commit_ts().into(),
             req.get_version().into(),
             Some(Key::from_raw(req.get_end_key())),
             Some(Key::from_raw(req.get_start_key())),
             Some(Key::from_raw(req.get_start_key())),
-            req.take_context(),
+            ctx,
         )
     }
 }

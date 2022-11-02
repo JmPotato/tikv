@@ -4696,6 +4696,7 @@ mod tests {
             storage
                 .sched_txn_command(
                     commands::FlashbackToVersionReadPhase::new(
+                        0,
                         start_ts,
                         commit_ts,
                         version,
@@ -4787,6 +4788,7 @@ mod tests {
         storage
             .sched_txn_command(
                 commands::FlashbackToVersionReadPhase::new(
+                    0,
                     start_ts,
                     commit_ts,
                     2.into(),
@@ -4810,6 +4812,7 @@ mod tests {
         storage
             .sched_txn_command(
                 commands::FlashbackToVersionReadPhase::new(
+                    0,
                     start_ts,
                     commit_ts,
                     1.into(),
@@ -4900,19 +4903,23 @@ mod tests {
                     .0,
             );
         }
+        println!("test_flashback_to_version_in_multi_batch first");
         // Flashback all records.
+        let flashback_start_ts = *ts.incr();
+        let flashback_commit_ts = *ts.incr();
         storage
             .sched_txn_command(
                 commands::FlashbackToVersionReadPhase::new(
-                    *ts.incr(),
-                    *ts.incr(),
+                    0,
+                    flashback_start_ts,
+                    flashback_commit_ts,
                     TimeStamp::zero(),
                     None,
                     Some(Key::from_raw(b"k")),
                     Some(Key::from_raw(b"k")),
                     Context::default(),
                 ),
-                expect_ok_callback(tx, 2),
+                expect_ok_callback(tx.clone(), 2),
             )
             .unwrap();
         rx.recv().unwrap();
@@ -4924,6 +4931,24 @@ mod tests {
                     .0,
             );
         }
+        println!("test_flashback_to_version_in_multi_batch second");
+        // Flashback all records again.
+        storage
+            .sched_txn_command(
+                commands::FlashbackToVersionReadPhase::new(
+                    0,
+                    flashback_start_ts,
+                    flashback_commit_ts,
+                    TimeStamp::zero(),
+                    None,
+                    Some(Key::from_raw(b"k")),
+                    Some(Key::from_raw(b"k")),
+                    Context::default(),
+                ),
+                expect_ok_callback(tx, 2),
+            )
+            .unwrap();
+        rx.recv().unwrap();
     }
 
     #[test]

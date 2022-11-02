@@ -22,6 +22,7 @@ command! {
         cmd_ty => (),
         display => "kv::command::flashback_to_version -> {} | {} {} | {:?}", (version, start_ts, commit_ts, ctx),
         content => {
+            region_id: u64,
             start_ts: TimeStamp,
             commit_ts: TimeStamp,
             version: TimeStamp,
@@ -62,6 +63,15 @@ impl CommandExt for FlashbackToVersion {
 
 impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for FlashbackToVersion {
     fn process_write(mut self, snapshot: S, context: WriteContext<'_, L>) -> Result<WriteResult> {
+        info!("FlashbackToVersion::process_write";
+            "region_id" => self.region_id,
+            "start_ts" => ?self.start_ts,
+            "commit_ts" => ?self.commit_ts,
+            "version" => ?self.version,
+            "end_key" => log_wrappers::Value::key(self.end_key.as_ref().unwrap_or(&Key::from_raw(b"")).as_encoded().as_slice()),
+            "next_lock_key" => log_wrappers::Value::key(self.next_lock_key.as_ref().unwrap_or(&Key::from_raw(b"")).as_encoded().as_slice()),
+            "next_write_key" => log_wrappers::Value::key(self.next_write_key.as_ref().unwrap_or(&Key::from_raw(b"")).as_encoded().as_slice()),
+        );
         let mut reader = ReaderWithStats::new(
             SnapshotReader::new_with_ctx(self.version, snapshot, &self.ctx),
             context.statistics,
@@ -94,6 +104,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for FlashbackToVersion {
                     ProcessResult::Res
                 } else {
                     let next_cmd = FlashbackToVersionReadPhase {
+                        region_id: self.region_id,
                         ctx: self.ctx,
                         deadline: self.deadline,
                         start_ts: self.start_ts,

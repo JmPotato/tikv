@@ -39,6 +39,7 @@ pub fn flashback_to_version_read_write<S: Snapshot>(
     flashback_start_ts: TimeStamp,
     flashback_commit_ts: TimeStamp,
     statistics: &mut Statistics,
+    region_id: u64,
 ) -> TxnResult<(Vec<(Key, Option<Write>)>, bool)> {
     if next_write_key.is_none() {
         return Ok((vec![], false));
@@ -69,6 +70,14 @@ pub fn flashback_to_version_read_write<S: Snapshot>(
                 commit_ts: flashback_commit_ts,
             }));
         }
+        info!(
+            "flashback_to_version_read_write check";
+            "region_id" => region_id,
+            "key" => log_wrappers::Value::key(key.as_encoded().as_slice()),
+            "commit_ts" => commit_ts,
+            "old_write" => ?old_write,
+            "flashback_commit_ts" => flashback_commit_ts
+        );
         // Although the first flashback preparation phase makes sure there will be no
         // writes other than flashback after it, we CAN NOT return directly here.
         // Suppose the second phase procedure contains two batches to flashback. After
@@ -86,6 +95,7 @@ pub fn flashback_to_version_read_write<S: Snapshot>(
         key_old_writes.push((key.clone(), old_write.clone()));
     }
     if key_old_writes.is_empty() {
+        info!("flashback_to_version_read_write key_old_writes is empty"; "region_id" => region_id);
         if let Some(last_write) = key_ts_old_writes.last() {
             key_old_writes.push((last_write.0.clone(), last_write.2.clone()));
         }
@@ -210,6 +220,7 @@ pub mod tests {
             start_ts,
             commit_ts,
             &mut statistics,
+            0,
         )
         .unwrap();
         assert!(!has_remain_writes);
