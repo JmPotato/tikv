@@ -44,6 +44,11 @@ pub fn flashback_to_version_read_write<S: Snapshot>(
     let mut next_write_key = next_write_key;
     // Try to read as many writes as possible in one batch.
     while key_old_writes.len() < FLASHBACK_BATCH_SIZE && has_remain_writes {
+        info!("[flashback_to_version_read_write] batch check";
+            "next_write_key" => log_wrappers::Value::key(next_write_key.as_encoded().as_slice()),
+            "key_old_writes.len()" => key_old_writes.len(),
+            "has_remain_writes" => has_remain_writes,
+        );
         let key_ts_old_writes;
         (key_ts_old_writes, has_remain_writes) = reader.scan_writes(
             Some(&next_write_key),
@@ -72,6 +77,12 @@ pub fn flashback_to_version_read_write<S: Snapshot>(
                     commit_ts: flashback_commit_ts,
                 }));
             }
+            info!("[flashback_to_version_read_write] batch result";
+                "key" => log_wrappers::Value::key(key.as_encoded().as_slice()),
+                "commit_ts" => commit_ts,
+                "flashback_commit_ts" => flashback_commit_ts,
+                "old_write" => ?old_write,
+            );
             // Although the first flashback preparation phase makes sure there will be no
             // writes other than flashback after it, we CAN NOT return directly here.
             // Suppose the second phase procedure contains two batches to flashback. After

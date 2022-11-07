@@ -130,13 +130,17 @@ impl<S: Snapshot> ReadCommand<S> for FlashbackToVersionReadPhase {
             FlashbackToVersionState::ScanWrite { next_write_key, .. } => {
                 let mut key_old_writes = flashback_to_version_read_write(
                     &mut reader,
-                    next_write_key,
+                    next_write_key.clone(),
                     &self.end_key,
                     self.version,
                     self.start_ts,
                     self.commit_ts,
                     statistics,
                 )?;
+                info!("[FlashbackToVersionState::ScanWrite]";
+                    "next_write_key" => log_wrappers::Value::key(next_write_key.as_encoded().as_slice()),
+                    "key_old_writes.length" => key_old_writes.len(),
+                );
                 if key_old_writes.is_empty() {
                     // No more writes to flashback, just return.
                     return Ok(ProcessResult::Res);
