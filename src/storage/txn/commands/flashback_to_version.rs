@@ -3,7 +3,7 @@
 // #[PerformanceCriticalPath]
 use std::mem;
 
-use txn_types::{Key, TimeStamp};
+use txn_types::{Key, Lock, LockType, TimeStamp};
 
 use crate::storage::{
     kv::WriteData,
@@ -88,6 +88,24 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for FlashbackToVersion {
                 ref mut next_write_key,
                 ref mut key_old_writes,
             } => {
+                // Hold a lock guard to prevent the resolved ts from advancing.
+                let lock_guard =
+                    ::futures_executor::block_on(txn.concurrency_manager.lock_key(next_write_key));
+                let flashback_start_ts = self.start_ts;
+                lock_guard.with_lock(|lock| {
+                    *lock = Some(Lock::new(
+                        LockType::Put,
+                        next_write_key.as_encoded().to_vec(),
+                        flashback_start_ts,
+                        0,
+                        None,
+                        TimeStamp::zero(),
+                        0,
+                        TimeStamp::zero(),
+                    ));
+                });
+                txn.guards.push(lock_guard);
+
                 if let Some(new_next_write_key) = flashback_to_version_write(
                     &mut txn,
                     &mut reader,
@@ -100,8 +118,12 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for FlashbackToVersion {
             }
         }
         let rows = txn.modifies.len();
+        let lock_guards = txn.take_guards();
         let mut write_data = WriteData::from_modifies(txn.into_modifies());
+        // To let the flashback modification could be proposed and applied successfully.
         write_data.extra.for_flashback = true;
+        // To let the CDC treat the flashback modification as an 1PC transaction.
+        write_data.extra.one_pc = true;
         Ok(WriteResult {
             ctx: self.ctx.clone(),
             to_be_write: write_data,
@@ -126,7 +148,7 @@ impl<S: Snapshot, L: LockManager> WriteCommand<S, L> for FlashbackToVersion {
             })(),
             lock_info: None,
             released_locks: ReleasedLocks::new(),
-            lock_guards: vec![],
+            lock_guards,
             response_policy: ResponsePolicy::OnApplied,
         })
     }

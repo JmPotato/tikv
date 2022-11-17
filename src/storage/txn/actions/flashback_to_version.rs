@@ -134,7 +134,7 @@ pub fn flashback_to_version_write(
             // delete the current key when needed.
             Write::new(WriteType::Delete, start_ts, None)
         };
-        txn.put_write(key.clone(), commit_ts, new_write.as_ref().to_bytes());
+        txn.put_write(key, commit_ts, new_write.as_ref().to_bytes());
     }
     Ok(None)
 }
