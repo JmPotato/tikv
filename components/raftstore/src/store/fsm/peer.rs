@@ -5108,7 +5108,9 @@ where
         };
         // Check whether the region is in the flashback state and the request could be
         // proposed.
-        if let Err(e) = util::check_flashback_state(self.fsm.peer.is_in_flashback, msg, region_id) {
+        if let Err(e) =
+            util::check_flashback_state(self.fsm.peer.is_in_flashback, msg, region_id, 1)
+        {
             match e {
                 Error::FlashbackInProgress(_) => self
                     .ctx
