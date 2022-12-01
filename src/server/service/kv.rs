@@ -1427,28 +1427,43 @@ fn future_prepare_flashback_to_version<E: Engine, L: LockManager, F: KvFormat>(
     storage: &Storage<E, L, F>,
     req: PrepareFlashbackToVersionRequest,
 ) -> impl Future<Output = ServerResult<PrepareFlashbackToVersionResponse>> {
+    let region_id = req.get_context().get_region_id();
     let storage = storage.clone();
     async move {
         let f = storage.get_engine().start_flashback(req.get_context());
         let mut res = f.await.map_err(storage::Error::from);
-        info!("[future_prepare_flashback_to_version] prepare flashback result"; "res" => ?res);
+        info!("[future_prepare_flashback_to_version] prepare flashback result";
+            "res" => ?res,
+        );
         if matches!(res, Ok(())) {
             // After the region is put into the flashback state, we need to do a special
             // prewrite to prevent `resolved_ts` from advancing.
             let (cb, f) = paired_future_callback();
             res = storage.sched_txn_command(req.clone().into(), cb);
-            info!("[future_prepare_flashback_to_version] sched_txn_command prepare flashback result"; "res" => ?res);
+            info!("[future_prepare_flashback_to_version] sched_txn_command prepare flashback result";
+                "region_id" => region_id,
+                "res" => ?res,
+            );
             if matches!(res, Ok(())) {
                 res = f.await.unwrap_or_else(|e| Err(box_err!(e)));
-                info!("[future_prepare_flashback_to_version] wait sched_txn_command prepare flashback result"; "res" => ?res);
+                info!("[future_prepare_flashback_to_version] wait sched_txn_command prepare flashback result";
+                    "region_id" => region_id,
+                    "res" => ?res,
+                );
             }
         }
         let mut resp = PrepareFlashbackToVersionResponse::default();
         if let Some(e) = extract_region_error(&res) {
-            info!("[future_prepare_flashback_to_version] region error"; "e" => ?e);
+            info!("[future_prepare_flashback_to_version] region error";
+                "region_id" => region_id,
+                "e" => ?e,
+            );
             resp.set_region_error(e);
         } else if let Err(e) = res {
-            info!("[future_prepare_flashback_to_version] error"; "e" => ?e);
+            info!("[future_prepare_flashback_to_version] error";
+                "region_id" => region_id,
+                "e" => ?e,
+            );
             resp.set_error(format!("{}", e));
         }
         Ok(resp)
@@ -1462,16 +1477,23 @@ fn future_flashback_to_version<E: Engine, L: LockManager, F: KvFormat>(
     storage: &Storage<E, L, F>,
     req: FlashbackToVersionRequest,
 ) -> impl Future<Output = ServerResult<FlashbackToVersionResponse>> {
+    let region_id = req.get_context().get_region_id();
     let storage = storage.clone();
     async move {
         // Perform the data flashback transaction command. We will check if the region
         // is in the flashback state when proposing the flashback modification.
         let (cb, f) = paired_future_callback();
         let mut res = storage.sched_txn_command(req.clone().into(), cb);
-        info!("[future_flashback_to_version] sched_txn_command finish flashback result"; "res" => ?res);
+        info!("[future_flashback_to_version] sched_txn_command finish flashback result";
+            "region_id" => region_id,
+            "res" => ?res,
+        );
         if matches!(res, Ok(())) {
             res = f.await.unwrap_or_else(|e| Err(box_err!(e)));
-            info!("[future_flashback_to_version] wait sched_txn_command finish flashback result"; "res" => ?res);
+            info!("[future_flashback_to_version] wait sched_txn_command finish flashback result";
+                "region_id" => region_id,
+                "res" => ?res,
+            );
         }
         if matches!(res, Ok(())) {
             // Only finish flashback when Flashback executed successfully.
@@ -1480,14 +1502,23 @@ fn future_flashback_to_version<E: Engine, L: LockManager, F: KvFormat>(
             });
             let f = storage.get_engine().end_flashback(req.get_context());
             res = f.await.map_err(storage::Error::from);
-            info!("[future_flashback_to_version] finish flashback result"; "res" => ?res);
+            info!("[future_flashback_to_version] finish flashback result";
+                "region_id" => region_id,
+                "res" => ?res,
+            );
         }
         let mut resp = FlashbackToVersionResponse::default();
         if let Some(err) = extract_region_error(&res) {
-            info!("[future_flashback_to_version] region error"; "e" => ?err);
+            info!("[future_flashback_to_version] region error";
+                "region_id" => region_id,
+                "e" => ?err,
+            );
             resp.set_region_error(err);
         } else if let Err(e) = res {
-            info!("[future_flashback_to_version] error"; "e" => ?e);
+            info!("[future_flashback_to_version] error";
+                "region_id" => region_id,
+                "e" => ?e,
+            );
             resp.set_error(format!("{}", e));
         }
         Ok(resp)

@@ -325,10 +325,6 @@ pub fn check_flashback_state(
         && (req.get_admin_request().get_cmd_type() == AdminCmdType::PrepareFlashback
             || req.get_admin_request().get_cmd_type() == AdminCmdType::FinishFlashback)
     {
-        info!("check_flashback_state allow admin";
-            "is_in_flashback" => is_in_flashback,
-            "source" => source,
-        );
         return Ok(());
     }
     let is_flashback_request = WriteBatchFlags::from_bits_truncate(req.get_header().get_flags())
@@ -336,10 +332,6 @@ pub fn check_flashback_state(
     // If the region is in the flashback state, the only allowed request is the
     // flashback request itself.
     if is_in_flashback && !is_flashback_request {
-        info!("check_flashback_state reject non flashback";
-            "is_in_flashback" => is_in_flashback,
-            "source" => source,
-        );
         return Err(Error::FlashbackInProgress(region_id));
     }
     // If the region is not in the flashback state, the flashback request itself
@@ -347,14 +339,12 @@ pub fn check_flashback_state(
     if !is_in_flashback && is_flashback_request {
         info!("check_flashback_state reject flashback";
             "is_in_flashback" => is_in_flashback,
+            "req" => ?req,
+            "region_id" => region_id,
             "source" => source,
         );
         return Err(Error::FlashbackNotPrepared(region_id));
     }
-    info!("check_flashback_state allow flashback";
-        "is_in_flashback" => is_in_flashback,
-        "source" => source,
-    );
     Ok(())
 }
 
