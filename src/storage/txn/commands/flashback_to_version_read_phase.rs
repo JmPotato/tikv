@@ -201,6 +201,7 @@ impl<S: Snapshot> ReadCommand<S> for FlashbackToVersionReadPhase {
                     if check_flashback_commit(
                         &mut reader,
                         &start_key,
+                        self.version,
                         self.start_ts,
                         self.commit_ts,
                     )? {

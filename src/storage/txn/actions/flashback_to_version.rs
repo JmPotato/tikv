@@ -189,6 +189,7 @@ pub fn commit_flashback_key(
     txn: &mut MvccTxn,
     reader: &mut MvccReader<impl Snapshot>,
     key_to_commit: &Key,
+    flashback_version: TimeStamp,
     flashback_start_ts: TimeStamp,
     flashback_commit_ts: TimeStamp,
 ) -> TxnResult<()> {
@@ -212,6 +213,12 @@ pub fn commit_flashback_key(
             flashback_commit_ts,
         );
     } else {
+        info!("commit_flashback_key failed";
+            "key_to_commit" => log_wrappers::Value::key(key_to_commit.as_encoded()),
+            "flashback_version" => flashback_version,
+            "flashback_start_ts" => flashback_start_ts,
+            "flashback_commit_ts" => flashback_commit_ts,
+        );
         return Err(txn::Error::from_mvcc(mvcc::ErrorInner::TxnLockNotFound {
             start_ts: flashback_start_ts,
             commit_ts: flashback_commit_ts,
@@ -225,6 +232,7 @@ pub fn commit_flashback_key(
 pub fn check_flashback_commit(
     reader: &mut MvccReader<impl Snapshot>,
     key_to_commit: &Key,
+    flashback_version: TimeStamp,
     flashback_start_ts: TimeStamp,
     flashback_commit_ts: TimeStamp,
 ) -> TxnResult<bool> {
@@ -234,6 +242,12 @@ pub fn check_flashback_commit(
             if lock.ts == flashback_start_ts {
                 return Ok(false);
             }
+            info!("check_flashback_commit failed: no lock";
+                "key_to_commit" => log_wrappers::Value::key(key_to_commit.as_encoded()),
+                "flashback_version" => flashback_version,
+                "flashback_start_ts" => flashback_start_ts,
+                "flashback_commit_ts" => flashback_commit_ts,
+            );
         }
         // If the lock doesn't exist and the flashback commit record exists, it means the flashback
         // has been finished.
@@ -244,6 +258,21 @@ pub fn check_flashback_commit(
                 if commit_ts == flashback_commit_ts && write.start_ts == flashback_start_ts {
                     return Ok(true);
                 }
+                info!("check_flashback_commit failed: mismatched write";
+                    "key_to_commit" => log_wrappers::Value::key(key_to_commit.as_encoded()),
+                    "flashback_version" => flashback_version,
+                    "flashback_start_ts" => flashback_start_ts,
+                    "flashback_commit_ts" => flashback_commit_ts,
+                    "commit_ts" => commit_ts,
+                    "start_ts" => write.start_ts,
+                );
+            } else {
+                info!("check_flashback_commit failed: no write";
+                    "key_to_commit" => log_wrappers::Value::key(key_to_commit.as_encoded()),
+                    "flashback_version" => flashback_version,
+                    "flashback_start_ts" => flashback_start_ts,
+                    "flashback_commit_ts" => flashback_commit_ts,
+                );
             }
         }
     }
@@ -378,7 +407,15 @@ pub mod tests {
             get_first_user_key(&mut reader, &Key::from_raw(key), &Key::from_raw(b"z"))
                 .unwrap()
                 .unwrap();
-        commit_flashback_key(&mut txn, &mut reader, &key_to_lock, start_ts, commit_ts).unwrap();
+        commit_flashback_key(
+            &mut txn,
+            &mut reader,
+            &key_to_lock,
+            TimeStamp::zero(),
+            start_ts,
+            commit_ts,
+        )
+        .unwrap();
         let rows = txn.modifies.len();
         write(engine, &ctx, txn.into_modifies());
         rows
